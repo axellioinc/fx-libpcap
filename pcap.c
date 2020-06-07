@@ -124,6 +124,10 @@ struct rtentry;		/* declarations in <net/if.h> */
 #include "pcap-rdmasniff.h"
 #endif
 
+#ifdef PCAP_SUPPORT_AXELLIO
+#include "pcap-axellio.h"
+#endif
+
 #ifdef _WIN32
 /*
  * DllMain(), required when built as a Windows DLL.
@@ -548,6 +552,9 @@ static struct capture_source_type {
 #endif
 #ifdef PCAP_SUPPORT_RDMASNIFF
 	{ rdmasniff_findalldevs, rdmasniff_create },
+#endif
+#ifdef PCAP_SUPPORT_AXELLIO
+	{ pcap_axellio_findalldevs, pcap_axellio_create },
 #endif
 	{ NULL, NULL }
 };
@@ -1440,6 +1447,9 @@ pcap_lookupnet(const char *device, bpf_u_int32 *netp, bpf_u_int32 *maskp,
 #ifdef PCAP_SUPPORT_NETMAP
 	    || strncmp(device, "netmap:", 7) == 0
 	    || strncmp(device, "vale", 4) == 0
+#endif
+#ifdef PCAP_SUPPORT_AXELLIO
+	    || strncmp(device, "axellio:", 8) == 0
 #endif
 	    ) {
 		*netp = *maskp = 0;

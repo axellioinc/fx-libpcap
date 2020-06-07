@@ -1401,6 +1401,10 @@ main(void)
     endif(PCAP_SUPPORT_NETMAP)
 endif()
 
+#if(NOT DISABLE_AXELLIO)
+    set(PROJECT_SOURCE_LIST_C ${PROJECT_SOURCE_LIST_C} pcap-axellio.c)
+#endif()
+
 # Check for Bluetooth sniffing support
 if(NOT DISABLE_BLUETOOTH)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

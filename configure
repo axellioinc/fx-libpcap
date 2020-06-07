@@ -633,6 +633,8 @@ BT_SRC
 PCAP_SUPPORT_BT
 NETMAP_SRC
 PCAP_SUPPORT_NETMAP
+AXELLIO_SRC
+PCAP_SUPPORT_AXELLIO
 NETFILTER_SRC
 PCAP_SUPPORT_NETFILTER
 USB_SRC
@@ -767,6 +769,7 @@ enable_universal
 enable_shared
 enable_usb
 enable_netmap
+enable_axellio
 enable_bluetooth
 enable_dbus
 enable_rdma
@@ -10641,6 +10644,16 @@ $as_echo "#define PCAP_SUPPORT_NETMAP 1" >>confdefs.h
 
 fi
 
+if test "x$enable_axellio" != "xno" ; then
+	{ $as_echo "$as_me:${as_lineno-$LINENO}: checking whether we can compile axellio support" >&5
+$as_echo_n "checking whether we can compile axellio support... " >&6; }
+	{ $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+$as_echo "yes" >&6; }
+
+$as_echo "#define PCAP_SUPPORT_AXELLIO 1" >>confdefs.h
+
+AXELLIO_SRC=pcap-axellio.c
+fi
 
 # Check whether --enable-bluetooth was given.
 if test "${enable_bluetooth+set}" = set; then :
