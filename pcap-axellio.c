@@ -131,7 +131,6 @@ static int pcap_axellio_get_wait( pcap_t *PPcap, int64_t TimeoutNs )
             return( 0 );
         }
     }
-    //UNTESTED();
     pRing->meta.state = 1;
     return( 1 );    /* Something is available */
 }
@@ -210,10 +209,8 @@ static int pcap_axellio_read( pcap_t *PPcap,
          * our usage to the actual size of the ring/e.g. data[] but all other
          * tests can use get < put indicating data is available.
          */
-        //UNTESTED();
         if (*pGet < *pPut)
         {
-            //UNTESTED();
             pData = &pRing->data[ (*pGet) % SHM_RING_SIZE ];
             pPacket = &pData->buf[ pRing->meta.get_seg_offset ];
             pAxPcapHdr = (ax_pcap_pkthdr_t *)pPacket;
@@ -221,7 +218,9 @@ static int pcap_axellio_read( pcap_t *PPcap,
             pktLen = pAxPcapHdr->caplen;
             if (pktLen > PPcap->snapshot)
             {
-                UNTESTED();
+                /* I've seen this when the data flow from the shared memory
+                 * queue was bad but not otherwise.
+                 */
                 pktLen = PPcap->snapshot;
             }
 
@@ -229,16 +228,19 @@ static int pcap_axellio_read( pcap_t *PPcap,
             pcapHdr.ts.tv_usec = pAxPcapHdr->ts_usec;
             pcapHdr.caplen = pktLen;
             pcapHdr.len = pAxPcapHdr->len;
-            if ((PPcap->fcode.bf_insns == NULL) ||
-                (bpf_filter(PPcap->fcode.bf_insns,
-                            pPacket, pcapHdr.len, pcapHdr.caplen)))
+#if 1
+            if (PPcap->fcode.bf_insns == NULL)
             {
-                //UNTESTED();
+                UNTESTED();
+            }
+#endif
+            if (bpf_filter(PPcap->fcode.bf_insns,
+                           pPacket, pcapHdr.len, pcapHdr.caplen))
+            {
                 PCb( PCbArg, &pcapHdr, pPacket );
             }
             else
             {
-                UNTESTED();
                 pAx->PacketsDropped++;
             }
 
@@ -252,7 +254,6 @@ static int pcap_axellio_read( pcap_t *PPcap,
             if (pRing->meta.get_seg_offset >= pData->header.length)
             {
                 /* Move to next segment to pick packets from */
-                //UNTESTED();
                 (*pGet)++;
                 pRing->meta.get_seg_offset = 0;
             }
@@ -379,7 +380,6 @@ static int pcap_axellio_activate( pcap_t *PPcap )
     pAx->Shmid = shmget( AX_SHM_KEY, sizeof(ax_shmem_t), SHM_R | SHM_W );
     if (pAx->Shmid < 0)
     {
-        //UNTESTED();
         snprintf(PPcap->errbuf, PCAP_ERRBUF_SIZE,
                  "Unable to find AX shared memory region");
         pcap_cleanup_live_common( PPcap );
