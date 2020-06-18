@@ -12,297 +12,564 @@
 #include <time.h>
 
 #include <sys/time.h>
+#include <sys/types.h>  //required for shm
+#include <sys/ipc.h>    //shm
+#include <sys/shm.h>
 
 #include "pcap-int.h"
 #include "pcap-axellio.h"
 
-#define DPDK_PREFIX "dpdk:"
+#define UNTESTED()  fprintf(stderr, "UNTESTED %s:%d\n", __FILE__, __LINE__);
 
 //this struct is our stateful information passed to us by pcap
-struct pcap_axellio{
-	pcap_t * orig;
-	uint16_t portid; // portid of DPDK
-	//int must_clear_promisc;
-	//uint64_t bpf_drop;
-	int nonblock;
-	//struct timeval required_select_timeout;
-	//struct timeval prev_ts;
-	//struct rte_eth_stats prev_stats;
-	//struct timeval curr_ts;
-	//struct rte_eth_stats curr_stats;
-	//uint64_t pps;
-	//uint64_t bps;
-	//struct rte_mempool * pktmbuf_pool;
-	//struct dpdk_ts_helper ts_helper;
-	//ETHER_ADDR_TYPE eth_addr;
-	//char mac_addr[DPDK_MAC_ADDR_SIZE];
-	//char pci_addr[DPDK_PCI_ADDR_SIZE];
-	//unsigned char pcap_tmp_buf[RTE_ETH_PCAP_SNAPLEN];
+struct pcap_axellio
+{
+    pcap_t *PPcap;
+
+    ax_shm_ring_t *PRing;
+    unsigned int SegOffset;
+    ax_shmem_t *PShmem;
+    int Shmid;
+
+    int NonBlock;
+
+    u_int PacketsRx;
+    u_int PacketsDropped;
+    u_int PacketsIfDropped;
+    //struct timeval required_select_timeout;
 };
-#if 0
-static int dpdk_read_with_timeout(pcap_t *p, struct rte_mbuf **pkts_burst, const uint16_t burst_cnt){
-	struct pcap_dpdk *pd = (struct pcap_dpdk*)(p->priv);
-	int nb_rx = 0;
-	int timeout_ms = p->opt.timeout;
-	int sleep_ms = 0;
-	if (pd->nonblock){
-		// In non-blocking mode, just read once, no matter how many packets are captured.
-		nb_rx = (int)rte_eth_rx_burst(pd->portid, 0, pkts_burst, burst_cnt);
-	}else{
-		// In blocking mode, read many times until packets are captured or timeout or break_loop is setted.
-		// if timeout_ms == 0, it may be blocked forever.
-		while (timeout_ms == 0 || sleep_ms < timeout_ms){
-			nb_rx = (int)rte_eth_rx_burst(pd->portid, 0, pkts_burst, burst_cnt);
-			if (nb_rx){ // got packets within timeout_ms
-				break;
-			}else{ // no packet arrives at this round.
-				if (p->break_loop){
-					break;
-				}
-				// sleep for a very short while.
-				// block sleep is the only choice, since usleep() will impact performance dramatically.
-				rte_delay_us_block(DPDK_DEF_MIN_SLEEP_MS*1000);
-				sleep_ms += DPDK_DEF_MIN_SLEEP_MS;
-			}
-		}
-	}
-	return nb_rx;
-}
 
-static void nic_stats_display(struct pcap_dpdk *pd)
-{
-	uint16_t portid = pd->portid;
-	struct rte_eth_stats stats;
-	rte_eth_stats_get(portid, &stats);
-	RTE_LOG(INFO,USER1, "portid:%d, RX-packets: %-10"PRIu64"  RX-errors:  %-10"PRIu64
-	       "  RX-bytes:  %-10"PRIu64"  RX-Imissed:  %-10"PRIu64"\n", portid, stats.ipackets, stats.ierrors,
-	       stats.ibytes,stats.imissed);
-	RTE_LOG(INFO,USER1, "portid:%d, RX-PPS: %-10"PRIu64" RX-Mbps: %.2lf\n", portid, pd->pps, pd->bps/1e6f );
-}
-
-
-static void eth_addr_str(ETHER_ADDR_TYPE *addrp, char* mac_str, int len)
-{
-	int offset=0;
-	if (addrp == NULL){
-		snprintf(mac_str, len-1, DPDK_DEF_MAC_ADDR);
-		return;
-	}
-	for (int i=0; i<6; i++)
-	{
-		if (offset >= len)
-		{ // buffer overflow
-			return;
-		}
-		if (i==0)
-		{
-			snprintf(mac_str+offset, len-1-offset, "%02X",addrp->addr_bytes[i]);
-			offset+=2; // FF
-		}else{
-			snprintf(mac_str+offset, len-1-offset, ":%02X", addrp->addr_bytes[i]);
-			offset+=3; // :FF
-		}
-	}
-	return;
-}
-#endif
-
-static u_char dummypacket[1500] = 
+static u_char dummypacket[100] =
 {
     0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, //Ether Dst
     0xcb, 0xa9, 0x87, 0x65, 0x43, 0x21, //Ether Src
-    0x80, 0x00, //Ether IP 
+    0x08, 0x00, //Ether IP
     0x45, 0x00, //IPV4, 5 words
-    0x05, 0xCE, //total len = 1500-14
+    0x00, 0x56, //total len -14
     0x01, 0x11, //ID
     0x00, 0x00, //frag/offset
     0x12, 0x11, //TTL, UDP
     0xaa, 0x55, //checksum==bad
     0xc0, 0xa8, 0x53, 0x10, //src IP
     0xc0, 0xa8, 0x54, 0x11, //dst IP
-    0x12, 0x34, //UDP src port
-    0x43, 0x21, //UDP dst port
-    0x05, 0xba, //length
+    0x56, 0x54, //UDP src port
+    0x55, 0x56, //UDP dst port
+    0x00, 0x42, //length including UDP hdr
     0x00, 0x00, //checksum
     0x01, 0x02, 0x03, 0x04  //payload
 };
 
-static int pcap_axellio_read(pcap_t *p, int max_cnt, pcap_handler cb, u_char *cb_arg)
+/**
+ *
+ *
+ * @param PPcap
+ * @param TimeoutNs - When <= 0, there is no timeout and this will wait forever.
+ *                  When == 1, there is no waiting, this will just do the quick
+ *                  check and return, otherwise the timeout is defined in
+ *                  nanoseconds and this will wait up to that amount of time
+ *                  while checking for data to be available.
+ *
+ * @return 0 - Timedout or 'break_loop' and nothing available, 1 - Data is
+ *         available on the ring
+ */
+static int pcap_axellio_get_wait( pcap_t *PPcap, int64_t TimeoutNs )
 {
-	struct pcap_axellio *pa = (struct pcap_axellio*)(p->priv);
-	int pkt_cnt = 0;
-	struct pcap_pkthdr pcap_header;
-    int i;
-    unsigned int pkt_len;    //raj should be 32-bit unsigned
-    u_char *bp;
+    ax_shm_ring_t *pRing;
+    volatile u_int64_t *pPut;
+    struct timespec ts;
+    int64_t now;
+    int64_t expire;
 
-	while(PACKET_COUNT_IS_UNLIMITED(max_cnt) || pkt_cnt < max_cnt)
+    pRing = ((struct pcap_axellio *)PPcap->priv)->PRing;
+    pRing->meta.state = 3;
+    pPut = &pRing->meta.put;    //need the volatile or some other construct
+    if (*pPut == pRing->meta.get)
     {
-		if (p->break_loop)
+        now = -1;
+        expire = 0;
+        if (TimeoutNs > 1)
         {
-			p->break_loop = 0;
-			return PCAP_ERROR_BREAK;
-		}
-#if 0
-		// read once in non-blocking mode, or try many times waiting for timeout_ms.
-		// if timeout_ms == 0, it will be blocked until one packet arrives or break_loop is set.
-		nb_rx = dpdk_read_with_timeout(p, pkts_burst, burst_cnt);
-		if (nb_rx == 0)
+            (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+            now = ((int64_t)ts.tv_sec * 1000000000LL) +
+                  (int64_t)ts.tv_nsec;
+            expire = now + TimeoutNs;
+        }
+        else if (TimeoutNs == 1)
         {
-			if (pd->nonblock)
+            /* We don't want to loop at all so we reset now to skip the loop
+             * below.
+             */
+            UNTESTED();
+            now = expire;
+        }
+
+        /* When expire == 0, now == -1 and this will loop until data is ready */
+        while ((*pPut == pRing->meta.get) &&
+               (now < expire) &&
+               (!PPcap->break_loop))
+        {
+            usleep( 100 );
+            if (expire > 0)
             {
-				RTE_LOG(DEBUG, USER1, "dpdk: no packets available in non-blocking mode.\n");
-			}
+                clock_gettime( CLOCK_MONOTONIC, &ts );
+                now = ((int64_t)ts.tv_sec * 1000000000LL) +
+                      (int64_t)ts.tv_nsec;
+            }
             else
             {
-				if (p->break_loop)
-                {
-					//_LOG("no packets available and break_loop is set in blocking mode.\n");
-					p->break_loop = 0;
-					return PCAP_ERROR_BREAK;
-				}
-				//_LOG("no packets available for timeout %d ms in blocking mode.\n", timeout_ms);
-			}
-			// break if read 0 packet, no matter in blocking(timeout) or non-blocking mode.
-			break;
-		}
-#endif
-		for (i = 0; i < 1; i++) 
+                UNTESTED();
+            }
+        }
+
+        /* To get here we either expired the timeout or we have data on the
+         * queue.
+         */
+        if (*pPut == pRing->meta.get)
         {
-            pkt_cnt++;
-			pkt_len = 1500;
-			pcap_header.caplen = pkt_len < p->snapshot ? pkt_len : p->snapshot;
-			pcap_header.len = pkt_len;
-			bp = &dummypacket[0]; //pointer to received packet from ring
-			if ((p->fcode.bf_insns == NULL) || 
-                (bpf_filter(p->fcode.bf_insns, bp, pcap_header.len, pcap_header.caplen)))
-            {
-				cb(cb_arg, &pcap_header, bp);
-			}
-            //else
-            //{
-			//    pd->bpf_drop++;
-			//}
-		}
-	}
-	return pkt_cnt;
-}
-static int pcap_axellio_inject(struct pcap *p, const void *buf _U_, size_t size _U_)
-{
-	//not implemented yet
-	pcap_strlcpy(p->errbuf,
-	    "axellio error: Inject function has not been implemented yet",
-	    PCAP_ERRBUF_SIZE);
-	return PCAP_ERROR;
-}
-
-static int pcap_axellio_setnonblock(pcap_t *p, int nonblock)
-{
-	struct pcap_axellio *pa = (struct pcap_axellio*)(p->priv);
-	pa->nonblock = nonblock;
-	return 0;
-}
-
-static int pcap_axellio_getnonblock(pcap_t *p)
-{
-	struct pcap_axellio *pa = (struct pcap_axellio*)(p->priv);
-	return pa->nonblock;
-}
-
-static int pcap_axellio_stats(pcap_t *p, struct pcap_stat *ps)
-{
-	//struct pcap_axellio *pa = p->priv;
-	if (ps)
-    {
-		ps->ps_recv += 1;
-		ps->ps_drop = 0;
-		ps->ps_ifdrop = 0;
-	}
-	return 0;
-}
-
-static void pcap_axellio_close(pcap_t *p)
-{
-	struct pcap_axellio *pa = p->priv;
-	if (pa==NULL)
-	{
-		return;
-	}
-    //perform any close operations opposite activate
-	pcap_cleanup_live_common(p);
-}
-
-//this code is called to setup pcap_axellio for each port defined
-static int pcap_axellio_activate(pcap_t *p)
-{
-	struct pcap_axellio *pa = p->priv;
-	pa->orig = p;
-	int ret = PCAP_ERROR;
-	//return PCAP_ERROR_NO_SUCH_DEVICE;
-	p->fd = 7;  //??raj 
-    if (p->snapshot <= 0 || p->snapshot > MAXIMUM_SNAPLEN)
-    {
-        p->snapshot = MAXIMUM_SNAPLEN;
+            //raj pfring code was leaving the state alone for a timeout return
+            //pRing->meta.state = 1;
+            return( 0 );
+        }
     }
-	p->linktype = DLT_EN10MB; // Ethernet, the 10MB is historical.
-	p->selectable_fd = p->fd;
-	p->read_op = pcap_axellio_read;
-	p->inject_op = pcap_axellio_inject;
-	p->setfilter_op = install_bpf_program; //pcap filter as we don't have one
-	p->setdirection_op = NULL;
-	p->set_datalink_op = NULL;
-	p->getnonblock_op = pcap_axellio_getnonblock;
-	p->setnonblock_op = pcap_axellio_setnonblock;
-	p->stats_op = pcap_axellio_stats;
-	p->cleanup_op = pcap_axellio_close;
-#if 0
-	p->breakloop_op = pcap_breakloop_common;
-	// set default timeout
-	pa->required_select_timeout.tv_sec = 0;
-	pa->required_select_timeout.tv_usec = DPDK_DEF_MIN_SLEEP_MS*1000;
-	p->required_select_timeout = &pa->required_select_timeout;
+    //UNTESTED();
+    pRing->meta.state = 1;
+    return( 1 );    /* Something is available */
+}
+
+static int pcap_axellio_read( pcap_t *PPcap,
+                              int MaxNumPackets,
+                              pcap_handler PCb,
+                              u_char *PCbArg )
+{
+    struct pcap_pkthdr pcapHdr;
+    struct pcap_axellio *pAx;
+    ax_shm_ring_t *pRing;
+    volatile u_int64_t *pPut;
+    volatile u_int64_t *pGet;
+    int totalPackets;
+    int64_t timeoutNs;
+    ax_shmring_data_t *pData;
+    unsigned char *pPacket;
+    ax_pcap_pkthdr_t *pAxPcapHdr;
+    u_int32_t pktLen;
+
+    /* Loop until we timeout or return a maximum defined number of packets */
+    pAx = (struct pcap_axellio *)PPcap->priv;
+    pRing = pAx->PRing;
+    pPut = (volatile u_int64_t *)&pRing->meta.put;
+    pGet = (volatile u_int64_t *)&pRing->meta.get;
+    totalPackets = 0;
+
+    /* Try to read data from the ring. We have two modes of operation, blocking
+     * and non blocking. During initial testing with tcpdump, the mode as
+     * blocking with a timeout of 1000ms. A timeout of zero is expected to wait
+     * forever. We setup the timeout here and use it through the loop.
+     */
+    timeoutNs = (int64_t)PPcap->opt.timeout * 1000000LL;
+    if (pAx->NonBlock)
+    {
+        /* For non-blocking we set the timeout to 1ns to get an immediate
+         * return, no waiting.
+         */
+        UNTESTED();
+        timeoutNs = 1;
+    }
+
+#if 1 //debug
+    /* I have only seen MaxNumPackets be 'unlimited' so far */
+    if (!PACKET_COUNT_IS_UNLIMITED(MaxNumPackets))
+    {
+        UNTESTED();
+    }
 #endif
-	ret = 0; // OK
-	if (ret <= PCAP_ERROR) // all kinds of error code
-	{
-		pcap_cleanup_live_common(p);
-	}
-	return ret;
+
+    while ((PACKET_COUNT_IS_UNLIMITED(MaxNumPackets)) ||
+           (totalPackets < MaxNumPackets))
+    {
+        /* The pcap library will set this flag to stop us */
+        if (PPcap->break_loop)
+        {
+            PPcap->break_loop = 0;
+            return( PCAP_ERROR_BREAK );
+        }
+
+        /* Try to read data from the ring. The timeoutNs is already setup for
+         * blocking and non blocking modes.
+         */
+        if (pcap_axellio_get_wait( PPcap, timeoutNs ) == 0)
+        {
+            if (pAx->NonBlock)  //raj debug?
+            {
+                //no packets available in non blocking mode
+                UNTESTED();
+            }
+            break;
+        }
+
+        /* get and put don't wrap, they just keep incrementing. We need to limit
+         * our usage to the actual size of the ring/e.g. data[] but all other
+         * tests can use get < put indicating data is available.
+         */
+        //UNTESTED();
+        if (*pGet < *pPut)
+        {
+            //UNTESTED();
+            pData = &pRing->data[ (*pGet) % SHM_RING_SIZE ];
+            pPacket = &pData->buf[ pRing->meta.get_seg_offset ];
+            pAxPcapHdr = (ax_pcap_pkthdr_t *)pPacket;
+            pPacket += sizeof(*pAxPcapHdr);
+            pktLen = pAxPcapHdr->caplen;
+            if (pktLen > PPcap->snapshot)
+            {
+                UNTESTED();
+                pktLen = PPcap->snapshot;
+            }
+
+            pcapHdr.ts.tv_sec = pAxPcapHdr->ts_sec;
+            pcapHdr.ts.tv_usec = pAxPcapHdr->ts_usec;
+            pcapHdr.caplen = pktLen;
+            pcapHdr.len = pAxPcapHdr->len;
+            if ((PPcap->fcode.bf_insns == NULL) ||
+                (bpf_filter(PPcap->fcode.bf_insns,
+                            pPacket, pcapHdr.len, pcapHdr.caplen)))
+            {
+                //UNTESTED();
+                PCb( PCbArg, &pcapHdr, pPacket );
+            }
+            else
+            {
+                UNTESTED();
+                pAx->PacketsDropped++;
+            }
+
+            /* Consume the packet from the ring now that we are done with it */
+            totalPackets++;
+            pAx->PacketsRx++;
+
+            pRing->meta.get_seg_offset +=
+                pAxPcapHdr->caplen + sizeof(*pAxPcapHdr);
+            pRing->meta.get_packet_cnt++;
+            if (pRing->meta.get_seg_offset >= pData->header.length)
+            {
+                /* Move to next segment to pick packets from */
+                //UNTESTED();
+                (*pGet)++;
+                pRing->meta.get_seg_offset = 0;
+            }
+        }
+    }
+    return( totalPackets );
 }
 
-// device name for axellio shoud be in the form as axellio:number, such as axellio:0
-pcap_t * pcap_axellio_create(const char *device, char *ebuf, int *is_ours)
+/**
+ * We currently do not implement the inject function.
+ *
+ * @param PPcap - This is the PCAP data structure that also contains our private
+ *              data.
+ * @return int Error status, 0 = no error
+ */
+static int pcap_axellio_inject( struct pcap *PPcap,
+                                const void *PBuf __attribute__((unused)),
+                                size_t BufLen __attribute__((unused)) )
 {
-	pcap_t *p=NULL;
-	*is_ours = 0;
-
-	*is_ours = !strncmp(device, "axellio:", 8);
-	if (! *is_ours)
-		return NULL;
-	//memset will happen
-	p = pcap_create_common(ebuf, sizeof(struct pcap_axellio));
-
-	if (p == NULL)
-		return NULL;
-	p->activate_op = pcap_axellio_activate;
-	return p;
+    UNTESTED();
+    snprintf(PPcap->errbuf, PCAP_ERRBUF_SIZE,
+             "axellio error: Inject function has not been implemented yet");
+    return( PCAP_ERROR );
 }
 
-int pcap_axellio_findalldevs(pcap_if_list_t *devlistp, char *ebuf)
+/**
+ * This allows the user to set a non-block state of on or off.
+ *
+ * @param PPcap - This is the PCAP data structure that also contains our private
+ *              data.
+ * @param NonBlock - 0 = allow block, 1 = do not allow block (non-blocking)
+ *
+ * @return int Error status, 0 = no error
+ */
+static int pcap_axellio_setnonblock( pcap_t *PPcap, int NonBlock )
 {
-	int ret;
+    struct pcap_axellio *pAx;
+
+    UNTESTED();
+    pAx = (struct pcap_axellio *)PPcap->priv;
+    pAx->NonBlock = NonBlock;
+    return( 0 );
+}
+
+static int pcap_axellio_getnonblock( pcap_t *PPcap )
+{
+    struct pcap_axellio *pAx;
+
+    UNTESTED();
+    pAx = (struct pcap_axellio *)PPcap->priv;
+    return( pAx->NonBlock );
+}
+
+static int pcap_axellio_stats( pcap_t *PPcap, struct pcap_stat *PStat )
+{
+    struct pcap_axellio *pAx;
+
+    if (PStat != NULL)
+    {
+        pAx = (struct pcap_axellio *)PPcap->priv;
+        PStat->ps_recv = pAx->PacketsRx;
+        PStat->ps_drop = pAx->PacketsDropped;
+        PStat->ps_ifdrop = pAx->PacketsIfDropped;
+    }
+    return 0;
+}
+
+/**
+ * This is called when the user of libpcap is done. This should cleanup the
+ * private data.
+ *
+ * @param PPcap - This is the PCAP data structure that also contains our private
+ *              data.
+ */
+static void pcap_axellio_close( pcap_t *PPcap )
+{
+    struct pcap_axellio *pAx;
+
+    pAx = (struct pcap_axellio *)PPcap->priv;
+    if (pAx != NULL)
+    {
+        AX_LOCK( &pAx->PShmem->lock );
+        pAx->PShmem->ref_count--;
+        pAx->PRing->meta.state = 66;
+        AX_UNLOCK( &pAx->PShmem->lock );
+
+        if (shmdt( pAx->PShmem ) != 0)
+        {
+            UNTESTED();
+        }
+        pAx->PShmem = NULL;
+
+        /* After this, pAx is no longer valid */
+        pcap_cleanup_live_common( PPcap );
+        pAx = NULL;
+    }
+}
+
+/**
+ * After the pcap_axellio_create() routine is called, this routine is called to
+ * active the individual device. We need to error check the actual device number
+ * as it corresponds to the shared memory ring and establish all of the shared
+ * memory connections.
+ *
+ * @param PPcap - This is the PCAP data structure that also contains our private
+ *              data.
+ * @return int - This is 0 for no error, or PCAP_ERROR or similar.
+ */
+static int pcap_axellio_activate( pcap_t *PPcap )
+{
+    struct pcap_axellio *pAx;
+    char *pEnd;
+    unsigned long devId;
+    uint8_t numRings;
+
+    /* Start to setup our private data structure */
+    pAx = (struct pcap_axellio *)PPcap->priv;
+    pAx->PPcap = PPcap;
+
+    /* If we create the shared memory segment then it will be initialized to
+     * zeroes. We really don't want to create the segment because if nothing is
+     * providing data to us then we would strand a bunch of memory.
+     */
+    pAx->Shmid = shmget( AX_SHM_KEY, sizeof(ax_shmem_t), SHM_R | SHM_W );
+    if (pAx->Shmid < 0)
+    {
+        //UNTESTED();
+        snprintf(PPcap->errbuf, PCAP_ERRBUF_SIZE,
+                 "Unable to find AX shared memory region");
+        pcap_cleanup_live_common( PPcap );
+        return( 0 );
+    }
+
+    pAx->PShmem = (ax_shmem_t *)shmat( pAx->Shmid, NULL, SHM_RND );
+    if (pAx->PShmem == (ax_shmem_t *)-1)
+    {
+        UNTESTED();
+        snprintf(PPcap->errbuf, PCAP_ERRBUF_SIZE,
+                 "Failed to attach shared memory region=%d/%s",
+                 errno, strerror(errno));
+        pcap_cleanup_live_common( PPcap );
+        return( PCAP_ERROR );
+    }
+
+    AX_LOCK( &pAx->PShmem->lock );
+    numRings = pAx->PShmem->num_rings;
+    printf("magic=%08x\n", pAx->PShmem->magic);
+    printf("numRings=%u\n", numRings);
+    AX_UNLOCK( &pAx->PShmem->lock );
+
+    /* Figure out which ring the user wants us to access */
+    devId = strtoul( &PPcap->opt.device[8], &pEnd, 10 );
+    if ((pEnd == &PPcap->opt.device[8]) || (*pEnd != '\0') ||
+        (devId >= numRings))
+    {
+        snprintf( PPcap->errbuf, PCAP_ERRBUF_SIZE,
+                  "axellio error: ring buffer ID is invalid. device '%s'",
+                  PPcap->opt.device);
+        pcap_cleanup_live_common( PPcap );
+        return( PCAP_ERROR_NO_SUCH_DEVICE );
+    }
+
+    /* We have validated devId so we can now setup our internal state */
+    AX_LOCK( &pAx->PShmem->lock );
+    pAx->PRing = &pAx->PShmem->ring[ devId ];
+    pAx->SegOffset = 0;
+
+    /* Mark this ring as being in use */
+    pAx->PShmem->ref_count++;
+    pAx->PRing->meta.state = 1; //raj?
+    AX_UNLOCK( &pAx->PShmem->lock );
+
+    pAx->NonBlock = 0;
+    pAx->PacketsRx = 0;
+    pAx->PacketsDropped = 0;
+    pAx->PacketsIfDropped = 0;
+
+    /* Setup our overrides for the pcap structure */
+    PPcap->read_op = pcap_axellio_read;
+    //PPcap->next_packet_op = NULL;
+    PPcap->fd = -1;
+    //PPcap->priv;
+    if ((PPcap->snapshot <= 0) || (PPcap->snapshot > MAXIMUM_SNAPLEN))
+    {
+        UNTESTED();
+        PPcap->snapshot = MAXIMUM_SNAPLEN;
+    }
+
+    PPcap->linktype = DLT_EN10MB; // Ethernet, the 10MB is historical.
+
+    //raj does this work?
+    PPcap->selectable_fd = -1;
+    PPcap->required_select_timeout = NULL;
+#if 0
+    pAx->required_select_timeout.tv_sec = 0;
+    pAx->required_select_timeout.tv_usec = DPDK_DEF_MIN_SLEEP_MS*1000;
+    PPcap->required_select_timeout = &pAx->required_select_timeout;
+#endif
+
+    //PPcap->activate_op        set prev
+    //PPcap->can_set_rfmon_op
+    PPcap->inject_op = pcap_axellio_inject;
+    //PPcap->save_current_filter_op
+    /* Use the libpcap filter routines as we don't have our own */
+    PPcap->setfilter_op = install_bpf_program;
+    PPcap->setdirection_op = NULL;
+    PPcap->set_datalink_op = NULL;
+    PPcap->getnonblock_op = pcap_axellio_getnonblock;
+    PPcap->setnonblock_op = pcap_axellio_setnonblock;
+    PPcap->stats_op = pcap_axellio_stats;
+    //PPcap->oneshot_callback
+    PPcap->cleanup_op = pcap_axellio_close;
+    return( 0 );
+}
+
+/**
+ * This routine is called to create the pcap data structure that will contain
+ * our private data fields. In addition we setup the routine callback that will
+ * fill in that structure. We are expecting the device name to be 'axellio:%u'.
+ * This routine is attached to a list in pcap.c so that we can be called to
+ * identify our own device.
+ */
+pcap_t * pcap_axellio_create( const char *DeviceName,
+                              char *ErrorBuf,
+                              int *IsOurs )
+{
+    pcap_t *pPcap;
+
+    /* Make sure the device is our expected type. We do get calls for other
+     * system devices and just need to reject those. It seems the pcap code just
+     * walks a list and calls create for all of them. At this point we only
+     * verify that the prefix of the name is what we expect, there is no range
+     * check on the device number or even to see if it exists. That will happen
+     * in the activate routine.
+     */
+    *IsOurs = !strncmp(DeviceName, "axellio:", 8);
+    if (!(*IsOurs))
+    {
+        return( NULL );
+    }
+
+    /* Create the pcap data structure with enough space for our private data */
+    pPcap = pcap_create_common( ErrorBuf, sizeof(struct pcap_axellio) );
+    if (pPcap == NULL)
+    {
+        UNTESTED();
+        return( NULL );
+    }
+
+    /* We only need to fill in the activate_op callback for now */
+    pPcap->activate_op = pcap_axellio_activate;
+    return( pPcap );
+}
+
+int pcap_axellio_findalldevs( pcap_if_list_t *devlistp, char *ErrorBuf )
+{
+    int ret;
     char name[64];
     char desc[64];
+    int shmid;
+    ax_shmem_t *pShmem;
+    uint8_t numRings;
+    uint8_t i;
 
-    // this code is where we would go find our shared memory via some mechanism
-    // return 0 if we find it, PCAP_ERROR if we don't
-    ret = 0;
-    snprintf(&name[0], sizeof(name), "axellio:0");
-    snprintf(&desc[0], sizeof(desc), "axellio interface axellio0 MAC:xx");
-    if (add_dev(devlistp, &name[0], 0, &desc[0], ebuf) == NULL)
+    /* If we create the shared memory segment then it will be initialized to
+     * zeroes. We really don't want to create the segment because if nothing is
+     * providing data to us then we would strand a bunch of memory.
+     */
+    shmid = shmget( AX_SHM_KEY, sizeof(ax_shmem_t),
+                    /*IPC_CREAT |*/ SHM_R | SHM_W
+                    );
+    if (shmid < 0)
     {
-        ret = PCAP_ERROR;
+        snprintf(ErrorBuf, PCAP_ERRBUF_SIZE,
+                 "Unable to find AX shared memory region");
+        return( 0 );
     }
-	return ret;
+
+    pShmem = (ax_shmem_t *)shmat( shmid, NULL, SHM_RND );
+    if (pShmem == (ax_shmem_t *)-1)
+    {
+        UNTESTED();
+        snprintf(ErrorBuf, PCAP_ERRBUF_SIZE,
+                 "Failed to attach shared memory region=%d/%s",
+                 errno, strerror(errno));
+        return( PCAP_ERROR );
+    }
+
+    AX_LOCK( &pShmem->lock );
+    numRings = pShmem->num_rings;
+    printf("magic=%08x\n", pShmem->magic);
+    printf("numRings=%u\n", numRings);
+    AX_UNLOCK( &pShmem->lock );
+
+    if (shmdt( pShmem ) != 0)
+    {
+        UNTESTED();
+        snprintf(ErrorBuf, PCAP_ERRBUF_SIZE,
+                 "Failed to detach shared memory region=%d/%s",
+                 errno, strerror(errno));
+        return( PCAP_ERROR );
+    }
+    pShmem = NULL;
+
+    ret = 0;
+    for (i = 0; i < numRings; i++)
+    {
+        snprintf(&name[0], sizeof(name), "axellio:%u", i);
+        snprintf(&desc[0], sizeof(desc),
+                 "Axellio shared memory interface %u", i);
+        if (add_dev(devlistp, &name[0], 0, &desc[0], ErrorBuf) == NULL)
+        {
+            UNTESTED();
+            ret = PCAP_ERROR;
+            break;
+        }
+    }
+    return( ret );
 }
 
