@@ -83,7 +83,14 @@ struct axrecvRing
     /**
      * This counts the number of packets in the buffers that have been put.
      */
-    volatile uint64_t PutPacketCount;
+    volatile uint64_t PutPackets;
+
+    /**
+     * This counts the number of times a put buffer has been flushed due to a
+     * timeout after some data was put into the buffer but before the buffer was
+     * full.
+     */
+    volatile uint64_t PutFlushes;
 
     /* All of the Get data is on the next cache line */
 
@@ -97,7 +104,7 @@ struct axrecvRing
     /**
      * This counts the number of packets in the buffers that have been read.
      */
-    volatile uint64_t GetPacketCount;
+    volatile uint64_t GetPackets;
 
     /**
      * This can be used for debugging or understanding the state of the 'get'
@@ -166,10 +173,10 @@ public:
      * just the resources needed by this class. Call Initialize() after
      * construction.
      *
-     * @param PLogName - The unique name for this class' logger.
+     * @param LogName - The unique name for this class' logger.
      * @param LogMask - The mask to turn on/off logs for this instance.
      */
-    axrecvRingSharedMem( const char *PLogName, uint64_t LogMask );
+    axrecvRingSharedMem( const std::string &LogName, uint64_t LogMask );
     virtual ~axrecvRingSharedMem();
     axrecvRingSharedMem( const axrecvRingSharedMem & ) = delete;
     axrecvRingSharedMem & operator = ( const axrecvRingSharedMem & ) = delete;

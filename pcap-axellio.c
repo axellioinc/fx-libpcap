@@ -279,7 +279,7 @@ static int ax_read( pcap_t *PPcap,
 
             /* Consume the packet from the ring now that we are done with it */
             totalPackets++;
-            pRing->GetPacketCount++;
+            pRing->GetPackets++;
             pRing->GetSegmentOffset +=
                 sizeof(*pAxPcapHdr) + pAxPcapHdr->incl_len;
             if (pRing->GetSegmentOffset >= pData->Length)
@@ -618,10 +618,11 @@ static void openSharedMem( void **PPShm, struct axrecvAllRings **PPAllRings )
                  ringIndex++, pRing++)
             {
                 pAllRings->Ring[ringIndex].Put = 0;
-                pAllRings->Ring[ringIndex].PutPacketCount = 0;
+                pAllRings->Ring[ringIndex].PutPackets = 0;
+                pAllRings->Ring[ringIndex].PutFlushes = 0;
 
                 pAllRings->Ring[ringIndex].Get = 0;
-                pAllRings->Ring[ringIndex].GetPacketCount = 0;
+                pAllRings->Ring[ringIndex].GetPackets = 0;
                 pAllRings->Ring[ringIndex].GetState = 0;
             }
         }
