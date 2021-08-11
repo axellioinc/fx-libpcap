@@ -107,7 +107,6 @@ static int ax_get_wait( pcap_t *PPcap, int64_t TimeoutNs )
             /* We don't want to loop at all so we reset now to skip the loop
              * below.
              */
-            UNTESTED();
             now = expire;
         }
 
@@ -184,7 +183,6 @@ static int ax_read( pcap_t *PPcap,
         /* For non-blocking we set the timeout to 1ns to get an immediate
          * return, no waiting.
          */
-        UNTESTED();
         timeoutNs = 1;
     }
 
@@ -323,7 +321,6 @@ static int ax_setnonblock( pcap_t *PPcap, int NonBlock )
 {
     struct AxPriv *pAx;
 
-    UNTESTED();
     pAx = (struct AxPriv *)PPcap->priv;
     if (unlikely(pAx == NULL))
     {
