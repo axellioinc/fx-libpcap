@@ -1,0 +1,27 @@
+all: rpm
+
+VERSION := $(shell cat VERSION)
+BUILD_DIR := $(PWD)/RPM_BUILD
+PREFIX_DIR := $(BUILD_DIR)/sandbox/fx-libpcap-$(VERSION)/usr
+
+clean:
+	@rm -rf $(BUILD_DIR)
+
+rpm:
+	./configure --prefix=$(PREFIX_DIR) --enable-axellio
+	make
+	make install
+	mkdir -p $(BUILD_DIR)
+	mkdir -p $(BUILD_DIR)/BUILD
+	mkdir -p $(BUILD_DIR)/RPMS
+	mkdir -p $(BUILD_DIR)/SOURCES
+	mkdir -p $(BUILD_DIR)/SPECS
+	mkdir -p $(BUILD_DIR)/SRPMS
+	cp fx-libpcap.spec $(BUILD_DIR)/SPECS/
+	sed -i 's/_VERSION_/$(VERSION)/g' $(BUILD_DIR)/SPECS/fx-libpcap.spec
+#	rm -rf $(BUILD_DIR)/sandbox
+#	mkdir -p $(BUILD_DIR)/sandbox/fx-libpcap-$(VERSION)/usr
+#	cp -r $(PREFIX_DIR)/* $(BUILD_DIR)/sandbox/fx-libpcap-$(VERSION)/usr/
+	tar czf $(BUILD_DIR)/SOURCES/fx-libpcap-$(VERSION).tar.gz -C $(BUILD_DIR)/sandbox/ fx-libpcap-$(VERSION)/
+	cd $(BUILD_DIR)
+	rpmbuild --quiet --define "_topdir $(BUILD_DIR)" -bb $(BUILD_DIR)/SPECS/fx-libpcap.spec
