@@ -8,6 +8,21 @@
 extern "C" {
 #endif  // __cplusplus
 
+#define AXSHM_PERMS (S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IWOTH|S_IROTH)
+#define MAX_NUM_RINGSETS 16
+#define RINGSET_OWNER_CMDLINE_MAX_LENGTH 2048
+#define AXRECV_SHMKEY 0xFA57DA7A
+
+// This defines the ring directory that lives in the well-known shared memory.
+struct axrecvRingDirectory {
+    int num_ringsets;
+    struct ringset_direntry {
+        char owner_commandline[RINGSET_OWNER_CMDLINE_MAX_LENGTH];
+        int owner_pid;
+        uint64_t owner_last_seen_time;
+    } ringsets[MAX_NUM_RINGSETS];
+};
+
 // This defines the number of rings we will allocate memory space for.
 // A provider of this ring data (axrecv) will only populate data for some number
 // of rings 0..NUM_RINGS. Because the shared memory might be created by a
@@ -27,12 +42,9 @@ extern "C" {
 // too much transaction overhead.
 #define AXRECV_BUFFER_SIZE          (64 * 1024)
 
-// This is the shared memory key for this ring.
-#define AXRECV_RING_KEY             0xFA57DA7A
-
 // The axSharedMem class allows us to set a 32-bit version to identify our data
 // structure for possible future changes. This is that version.
-#define AXRECV_RING_DATA_VERSION    1
+#define AXRECV_RING_DATA_VERSION    2
 
 // This is a single data buffer within the ring. Each buffer is expected to be
 // an integral multiple of the cache line size.
@@ -102,6 +114,16 @@ struct axrecvAllRings {
     struct axrecvRing Ring[AXRECV_NUM_RINGS];
 };
 
+struct recvSharedMemory {
+    struct axrecvRingDirectory directory;
+    struct axrecvAllRings ringsets[MAX_NUM_RINGSETS];
+};
+
+struct axrecvSharedMemory {
+    struct AxSharedMemHeader_v1 header;
+    struct recvSharedMemory recvSharedMemory;
+};
+
 #ifdef __cplusplus
 }   // End the extern C
 
@@ -114,7 +136,7 @@ struct axrecvAllRings {
 class axrecvRingSharedMem {
 public:
     // This is the key we use for this shared memory region.
-    static const key_t s_Key = AXRECV_RING_KEY;
+    static const key_t s_Key = AXRECV_SHMKEY;
 
     // This will report the size of the memory content we need.
     static const size_t s_Size = sizeof(axrecvAllRings);
@@ -132,14 +154,14 @@ public:
 
     // Initialize the shared memory. This routine will throw if it has any
     // issues mapping the shared memory.
-    void Initialize();
+    void Initialize(unsigned ringset);
 
     // This will return a pointer to the specific ring requested.
     //
     // @param RingIndex - Which ring to get access to, value from
     //                  0..AXRECV_NUM_RINGS-1
     // @return Pointer to the ring shared memory or NULL if invalid.
-    axrecvRing//PRing( unsigned RingIndex ) {
+    axrecvRing *PRing( unsigned RingIndex ) {
         if (likely((m_PAllRings != NULL) && (RingIndex < AXRECV_NUM_RINGS))) {
             return( &m_PAllRings->Ring[RingIndex] );
         }
@@ -151,13 +173,13 @@ public:
     void DumpSharedMem();
 
 private:
-    axLogInstance//m_PLogger;
+    axLogInstance *m_PLogger;
     int m_LogIdError;
     int m_LogIdWarn;
     int m_LogIdDebug;
 
-    axSharedMem//m_PSharedMem;
-    axrecvAllRings//m_PAllRings;
+    axSharedMem *m_PSharedMem;
+    axrecvAllRings *m_PAllRings;
 };
 
 #endif  // __cplusplus

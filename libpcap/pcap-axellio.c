@@ -15,34 +15,24 @@
 
 #define UNTESTED()  fprintf(stderr, "UNTESTED %s:%d\n", __FILE__, __LINE__);
 
-/**
- * This is our stateful information passed to us by pcap
- */
+// This is our stateful information passed to us by pcap
 struct AxPriv {
-    /**
-     * During configuration, our shared memory pointer to the ring buffer is
-     * setup here.
-     */
+    // During configuration, our shared memory pointer to the ring buffer is
+    // setup here.
     struct axrecvRing *PRing;
 
-    /**
-     * Our default is to be in blocking mode (NonBlock = 0). Pcap can request
-     * that we go into non-blocking mode.
-     */
+    // Our default is to be in blocking mode (NonBlock = 0). Pcap can request
+    // that we go into non-blocking mode.
     int NonBlock;
 
-    /**
-     * These are statistics for the stats() routine.
-     */
+    // These are statistics for the stats() routine.
     u_int PacketsRx;
     u_int PacketsDropped;
     u_int PacketsIfDropped;
 
-    /**
-     * This is the pointer to the shared memory that we will need to shmdt()
-     * upon exit.
-     */
-    void *PShm;
+    // This is the pointer to the shared memory that we will need to shmdt()
+    // upon exit.
+    void *shared_memory;
 };
 
 /**
@@ -317,8 +307,8 @@ ax_close( pcap_t *PPcap ) {
     pAx = (struct AxPriv *)PPcap->priv;
     if (likely(pAx != NULL)) {
         //pAx->PRing->GetState = 0;
-        (void)shmdt( pAx->PShm );
-        pAx->PShm = NULL;
+        (void)shmdt( pAx->shared_memory );
+        pAx->shared_memory = NULL;
 
         /* After this, pAx is no longer valid */
         pcap_cleanup_live_common( PPcap );
@@ -366,7 +356,7 @@ updateGid( int ShmId, const char *PGroupName ) {
 
 char *
 command_line_get(void) {
-    static char cmdline[2048];
+    static char cmdline[RINGSET_OWNER_CMDLINE_MAX_LENGTH];
     char file[256];
     int len,i;
     sprintf(file,"/proc/%d/cmdline",getpid());
@@ -388,31 +378,76 @@ command_line_get(void) {
     return cmdline;
 }
 
+// // Get a pointer to the shared memory ring directory. Create said directory
+// // if necessary.
+// static struct axrecvRingDirectory *
+// directory_get(void) {
+//     static struct axrecvRingDirectory *dir=NULL;
+//     int needs_init=0;
+//     if(dir) return dir;
+
+//     int shmid;
+//     do {
+//         shmid=shmget(AXRECV_DIRECTORY_SHMKEY,
+//           sizeof(struct axrecvRingDirectory),IPC_CREAT|IPC_EXCL|AXSHM_PERMS);
+//         if(shmid>=0) { // successfully created
+//             needs_init=1;
+//             break;
+//         }
+//         // Didn't create it -- either it exists or ???
+//         if(errno==EEXIST) {
+//             shmid=shmget(AXRECV_DIRECTORY_SHMKEY,
+//               sizeof(struct axrecvRingDirectory),AXSHM_PERMS);
+//             if(shmid>=0) {
+//                 needs_init=0;
+//                 break;
+//             }
+//             UNTESTED();
+//         }
+
+//         UNTESTED();
+//         usleep(100*1000);
+//     } while(!dir);
+
+//     dir=(struct axrecvRingDirectory *)shmat(shmid,NULL,0);
+//     if(dir==(struct axrecvRingDirectory *)-1) {
+//         printf("shmid=%x\n",shmid);
+//         perror("pxrecv directory attach");
+//         UNTESTED();
+//         exit(0);
+//     }
+
+//     if(needs_init) {
+//         memset(dir,0,sizeof(struct axrecvRingDirectory));
+//     }
+
+//     return dir;
+// }
+
 /**
- * @param PPShm - Returns the handle used to free the shared memory.
+ * @param Pshared_memory - Returns the handle used to free the shared memory.
  * @param PPAllRings - Returns the handle to the ring buffers.
  */
 static void 
-openSharedMem( void **PPShm, struct axrecvAllRings **PPAllRings ) {
-    struct AxSharedMemHeader_v1 *pShm;
+openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings ) {
+    struct axrecvSharedMemory *shm=NULL;
+    struct AxSharedMemHeader_v1 *header;
     int shmId;
     size_t shmSize;
     int needInit;
     int64_t retryUntil;
 
-    char *cmdline=command_line_get();
-    printf("cmdline is %s\n",cmdline);
-
-    pShm = NULL;
-    shmSize=sizeof(struct AxSharedMemHeader_v1)+sizeof(struct axrecvAllRings);
+printf("header:%d rings: %d\n",sizeof(struct AxSharedMemHeader_v1),sizeof(struct axrecvAllRings));
+printf("BLOB: %u\n",sizeof(struct axrecvSharedMemory));
+    shmSize=sizeof(struct axrecvSharedMemory);
     retryUntil = getMonotonicOffset() + (250LL * 1000000LL);
     do {
         needInit = 0;
         do {
             // Try to create the shared memory in exclusive mode. This will fail
             // if the memory is already created.
-            shmId = shmget( AXRECV_RING_KEY,shmSize,IPC_CREAT | IPC_EXCL |
-              S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+            shmId=shmget(AXRECV_SHMKEY,shmSize,IPC_CREAT|IPC_EXCL|
+              AXSHM_PERMS);
             if (shmId >= 0) {
                 needInit = 1;
                 break;
@@ -422,8 +457,8 @@ openSharedMem( void **PPShm, struct axrecvAllRings **PPAllRings ) {
             // exists then we can just attach to it and we don't need to
             // initialize it at all.
             if (errno == EEXIST) {
-                shmId = shmget( AXRECV_RING_KEY,shmSize,
-                  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP );
+                shmId = shmget( AXRECV_SHMKEY, shmSize, AXSHM_PERMS );
+                            perror("shmget");
                 if (shmId >= 0) {
                     needInit = 0;
                     break;
@@ -438,51 +473,53 @@ openSharedMem( void **PPShm, struct axrecvAllRings **PPAllRings ) {
 
         /* If the shared memory was found then attach it */
         if (shmId >= 0) {
-            pShm = (struct AxSharedMemHeader_v1 *)shmat( shmId, NULL, 0 );
-            if ((void *)pShm == (void *)-1) {
+            shm = (struct axrecvSharedMemory *)shmat( shmId, NULL, 0 );
+            if ((void *)shm == (void *)-1) {
                 UNTESTED();
                 //AXLOG(m_LogIdWarn, "Unable to map shared memory=%d/'%s'",
                 //      errno, strerror(errno));
-                pShm = NULL;
+                shm = NULL;
                 continue;
             }
+
+            header=&shm->header;
 
             if (needInit) {
                 // When shared memory is created, the memory is set to zero.
                 // Initialize the memory and set the magic value last.
-                pShm->HeaderVersion = AX_SHARED_MEM_LATEST_VERSION;
-                __atomic_store_n( &pShm->Magic, AX_SHARED_MEM_MAGIC,
+                header->HeaderVersion = AX_SHARED_MEM_LATEST_VERSION;
+                __atomic_store_n( &header->Magic, AX_SHARED_MEM_MAGIC,
                   __ATOMIC_SEQ_CST );
             } else {
                 // The shared memory already existed. Wait until the magic
                 // is set (in case it was just created and not yet initialized).
-                while ((__atomic_load_n(&pShm->Magic, __ATOMIC_SEQ_CST) !=
+                while ((__atomic_load_n(&header->Magic, __ATOMIC_SEQ_CST) !=
                   AX_SHARED_MEM_MAGIC) && (getMonotonicOffset() < retryUntil)) {
                     UNTESTED();
                     usleep( 1 * 1000 );     /* 1ms */
                 }
 
-                if (unlikely(__atomic_load_n(&pShm->Magic, __ATOMIC_SEQ_CST) !=
-                  AX_SHARED_MEM_MAGIC)) {
+                if (unlikely(__atomic_load_n(&header->Magic, __ATOMIC_SEQ_CST) 
+                  != AX_SHARED_MEM_MAGIC)) {
                     // The magic value isn't being set in a reasonable timeframe
                     // so let's assume this isn't our memory. There is no reason
                     // to retry any more because we got our shared memory region
                     // but the memory looks wrong, just give up.
                     UNTESTED();
-                    (void)shmdt( pShm );
-                    pShm = NULL;
+                    (void)shmdt( shm );
+                    shm = NULL;
                     break;
                 }
 
-                switch (pShm->HeaderVersion)  {
+                switch (header->HeaderVersion)  {
                 case AX_SHARED_MEM_LATEST_VERSION:
                     /* For now we only support one version */
                     break;
 
                 default: 
                     UNTESTED();
-                    (void)shmdt( pShm );
-                    pShm = NULL;
+                    (void)shmdt( shm );
+                    shm = NULL;
                     break;
                 }
             }
@@ -490,52 +527,112 @@ openSharedMem( void **PPShm, struct axrecvAllRings **PPAllRings ) {
         }
         UNTESTED();
         shmId = -1;
-        pShm = NULL;
-    } while ((pShm == NULL) && (getMonotonicOffset() < retryUntil));
+        shm = NULL;
+    } while ((shm == NULL) && (getMonotonicOffset() < retryUntil));
 
-    if (pShm == NULL) {
+    if (shm == NULL) {
         UNTESTED();
-        *PPShm = NULL;
+        priv->shared_memory = NULL;
         *PPAllRings = NULL;
-    } else {
-        unsigned ringIndex;
-        struct axrecvRing *pRing;
-        struct axrecvAllRings *pAllRings;
+        // we're going to crash very soon.
+        return;
+    } 
 
-        pAllRings = (struct axrecvAllRings *)&pShm[1];
-        if (needInit) {
-            // If we need to initialize then we need to make sure the group is
-            // setup the way we want.
-            updateGid( shmId, "apcnoperators" );
+    int i,loops=0;
 
-            pShm->DataVersion = AXRECV_RING_DATA_VERSION;
+    // First we need to figure out where our rings are. If they don't exist
+    // then we will create them.
+    struct axrecvRingDirectory *dir=&shm->recvSharedMemory.directory;
 
-            for (ringIndex = 0, pRing = &pAllRings->Ring[0];
-              ringIndex < sizeof(pAllRings->Ring)/sizeof(pAllRings->Ring[0]);
-              ringIndex++, pRing++) {
-                pAllRings->Ring[ringIndex].Put = 0;
-                pAllRings->Ring[ringIndex].PutPackets = 0;
-                pAllRings->Ring[ringIndex].PutFlushes = 0;
-
-                pAllRings->Ring[ringIndex].Get = 0;
-                pAllRings->Ring[ringIndex].GetPackets = 0;
-                pAllRings->Ring[ringIndex].GetState = 0;
-            }
-        } else {
-            switch (pShm->DataVersion) {
-            case AXRECV_RING_DATA_VERSION:
-                break;
-
-            default:
-                /* This is an unknown/unsupported version so bail out */
-                (void)shmdt( pShm );
-                pShm = NULL;
-                pAllRings = NULL;
-                break;
+    // Walk through the directory and see if this process already has a ring
+    char *cmdline=command_line_get();
+    printf("cmdline is %s\n",cmdline);
+    int ringset=-1;
+    struct ringset_direntry *de;
+    for(i=0;i<MAX_NUM_RINGSETS;i++) {
+        de=&dir->ringsets[i];
+        if(strncmp(cmdline,de->owner_commandline,
+          RINGSET_OWNER_CMDLINE_MAX_LENGTH))
+            continue;
+        // the name matches, let's hope there's not already an owner!
+        if(de->owner_pid) {
+            // maybe it's dead?
+            int still_alive=1;
+            char path[256];
+            sprintf(path,"/proc/%d",de->owner_pid);
+            struct stat sb;
+            while(0==stat(path,&sb)) {
+                // other process is running, wait here.
+                if(loops%100==0) fprintf(stderr,
+                  "waiting for identically run process %d to exit\n",
+                  de->owner_pid);
+                usleep(100 * 1000); // 100ms
+                loops++;
             }
         }
+        ringset=i;
+        break;
+    }
+    // If it wasn't there then go through the ringsets and find a good slot
+    while(ringset==-1) {
+        for(i=0;i<MAX_NUM_RINGSETS;i++) {
+            de=&dir->ringsets[i];
+            if(de->owner_last_seen_time==0) {
+                ringset=i;
+                break;
+            }
+            // TODO - expire slots that haven't been used lately
+        }
+        if(ringset!=-1) break;
+        loops++;
+        if(loops%100==0) fprintf(stderr,
+            "waiting for shared memory ring slot to become available\n");
+        usleep(100 * 1000);
+    }
+    // We are now the proud owner of ringset
+    de=&dir->ringsets[ringset];
+    de->owner_pid=getpid();
+    de->owner_last_seen_time=time(NULL);
+    strncpy(de->owner_commandline,cmdline,RINGSET_OWNER_CMDLINE_MAX_LENGTH);
+printf("We are in ringset %d\n",ringset);
 
-        *PPShm = pShm;
+    unsigned ringIndex;
+    struct axrecvRing *pRing;
+    struct axrecvAllRings *pAllRings;
+
+    pAllRings = (struct axrecvAllRings *)&shm->recvSharedMemory.ringsets[ringset];
+    if (needInit) {
+        // If we need to initialize then we need to make sure the group is
+        // setup the way we want.
+        updateGid( shmId, "apcnoperators" );
+
+        header->DataVersion = AXRECV_RING_DATA_VERSION;
+
+        for (ringIndex = 0, pRing = &pAllRings->Ring[0];
+            ringIndex < sizeof(pAllRings->Ring)/sizeof(pAllRings->Ring[0]);
+            ringIndex++, pRing++) {
+            pAllRings->Ring[ringIndex].Put = 0;
+            pAllRings->Ring[ringIndex].PutPackets = 0;
+            pAllRings->Ring[ringIndex].PutFlushes = 0;
+
+            pAllRings->Ring[ringIndex].Get = 0;
+            pAllRings->Ring[ringIndex].GetPackets = 0;
+            pAllRings->Ring[ringIndex].GetState = 0;
+        }
+    } else {
+        switch (header->DataVersion) {
+        case AXRECV_RING_DATA_VERSION:
+            break;
+
+        default:
+            /* This is an unknown/unsupported version so bail out */
+            (void)shmdt( shm );
+            shm = NULL;
+            pAllRings = NULL;
+            break;
+        }
+
+        priv->shared_memory = shm;
         *PPAllRings = pAllRings;
     }
 }
@@ -553,15 +650,14 @@ openSharedMem( void **PPShm, struct axrecvAllRings **PPAllRings ) {
 static int 
 ax_activate( pcap_t *PPcap ) {
     struct AxPriv *pAx;
-    void *pShm;
     struct axrecvAllRings *pAllRings;
     unsigned long devId;
     char *pEnd;
 
     /* Start to setup our private data structure */
     pAx = (struct AxPriv *)PPcap->priv;
-    openSharedMem( &pShm, &pAllRings );
-    if (pShm == NULL) {
+    openSharedMem( pAx, &pAllRings );
+    if (pAx->shared_memory == NULL) {
         pcap_cleanup_live_common( PPcap );
         return( PCAP_ERROR );
     }
@@ -575,13 +671,12 @@ ax_activate( pcap_t *PPcap ) {
                  "Valid range is 0..31.",
                  PPcap->opt.device);
 
-        (void)shmdt( pShm );
+        (void)shmdt( pAx->shared_memory );
         pcap_cleanup_live_common( PPcap );
         return( PCAP_ERROR_NO_SUCH_DEVICE );
     }
 
     /* We have validated devId so we can now setup our internal state */
-    pAx->PShm = pShm;
     pAx->PRing = &pAllRings->Ring[ devId ];
     //pAx->SegOffset = 0;
     //pAx->PRing->GetState = 1;   //mark in use
@@ -675,20 +770,19 @@ pcap_axellio_create( const char *PDeviceName, char *PErrorBuf,
  */
 int 
 pcap_axellio_findalldevs( pcap_if_list_t *PDevList, char *PErrorBuf ) {
-    void *pShm;
     struct axrecvAllRings *pAllRings;
     unsigned ringIndex;
     char name[64];
     char desc[64];
+    struct AxPriv private;
 
-    openSharedMem( &pShm, &pAllRings );
-    if (pShm == NULL) {
+    openSharedMem( &private, &pAllRings );
+    if (private.shared_memory == NULL) {
         UNTESTED();
         return( 0 );
     }
 
-    (void)shmdt( pShm );
-    pShm = NULL;
+    (void)shmdt(private.shared_memory);
     pAllRings = NULL;
     for (ringIndex = 0;
       ringIndex < sizeof(pAllRings->Ring)/sizeof(pAllRings->Ring[0]);
