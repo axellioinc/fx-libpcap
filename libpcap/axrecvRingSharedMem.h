@@ -116,12 +116,17 @@ struct axrecvAllRings {
 
 struct recvSharedMemory {
     struct axrecvRingDirectory directory;
-    struct axrecvAllRings ringsets[MAX_NUM_RINGSETS];
+    struct axrecvAllRings ringsets[1];
 };
 
 struct axrecvSharedMemory {
     struct AxSharedMemHeader_v1 header;
     struct recvSharedMemory recvSharedMemory;
+};
+
+struct axrecvSharedMemoryHeader {
+    struct AxSharedMemHeader_v1 header;
+    struct axrecvRingDirectory directory;
 };
 
 #ifdef __cplusplus

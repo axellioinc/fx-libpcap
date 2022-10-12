@@ -49,6 +49,271 @@ getMonotonicOffset() {
     (void)clock_gettime( CLOCK_MONOTONIC, &ts );
     return( (ts.tv_sec * 1000000000LL) + ts.tv_nsec );
 }
+// Get the commandline of this application
+static char *
+command_line_get(void) {
+    static char cmdline[RINGSET_OWNER_CMDLINE_MAX_LENGTH];
+    char file[256];
+    int len,i;
+    sprintf(file,"/proc/%d/cmdline",getpid());
+    int fd=open(file,O_RDONLY);
+    if(fd<0) {
+        perror("open cmdline");
+        return NULL;
+    }
+    len=read(fd,cmdline,2047);
+    if(len<0) {
+        close(fd);
+        perror("read cmdline");
+        return NULL;
+    }
+    for(i=0;i<len-1;i++) {
+        if(cmdline[i]=='\0') cmdline[i]=' ';
+    }
+    close(fd);
+    return cmdline;
+}
+
+static void 
+updateGid( int ShmId, const char *PGroupName ) {
+    struct shmid_ds ctrl;
+    int stat;
+    char *pNameBuf;
+    size_t nameBufSize;
+    struct group groupData;
+    struct group *pGroupResult;
+
+    /* Get the current settings */
+    stat = shmctl( ShmId, IPC_STAT, &ctrl );
+    if (stat < 0) {
+        UNTESTED();
+        //AXLOGTHROW(m_LogIdError, "UpdateGid() unable to check the current GID");
+        return;
+    }
+
+    /* Create some memory to return the strings in and attempt to get the group
+     * ID data we need. stat will be zero and pGroupResult will be non-NULL if
+     * we found the group data.
+     */
+    nameBufSize = 4*1024;
+    pNameBuf = (char *)malloc( nameBufSize );
+    pGroupResult = NULL;
+    stat = getgrnam_r( PGroupName, &groupData, pNameBuf, nameBufSize,
+      &pGroupResult );
+    if((stat != 0) || (pGroupResult == NULL)) {
+        /* Unable to find group, leave the shared memory group alone */
+    } else if (ctrl.shm_perm.gid != pGroupResult->gr_gid) {
+        /* IPC_SET allows us to change shm_perm.uid, shm_perm.gid, and (the
+         * least significant 9 bits of) shm_perm.mode.
+         */
+        ctrl.shm_perm.gid = pGroupResult->gr_gid;
+        stat = shmctl( ShmId, IPC_SET, &ctrl );
+    }
+    free( pNameBuf );
+}
+
+/**
+ * @param Pshared_memory - Returns the handle used to free the shared memory.
+ * @param PPAllRings - Returns the handle to the ring buffers.
+ */
+void * 
+openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings, 
+  int blocking ) {
+    struct axrecvSharedMemory *shm=NULL;
+    struct AxSharedMemHeader_v1 *header;
+    int shmId=-1;
+    int64_t retryUntil;
+    struct axrecvSharedMemoryHeader *shmheader;
+    int num_ringsets=0;
+
+    retryUntil = getMonotonicOffset() + (250LL * 1000000LL);
+
+    // Map the shared memory.
+    while((shm == NULL) && (getMonotonicOffset() < retryUntil)) {
+        // Try to get the shared memory header region ONLY.
+        shmId = shmget( AXRECV_SHMKEY, sizeof(struct axrecvSharedMemoryHeader), 
+          AXSHM_PERMS );
+        if(shmId<0) {
+            usleep( 1 * 1000 );     /* 1ms */
+            continue;
+        }
+
+        // Now attach to shared memory.
+        shmheader = (struct axrecvSharedMemoryHeader *)shmat( shmId, NULL, 0 );
+        if ((void *)shmheader == (void *)-1) {
+            UNTESTED();
+            //AXLOG(m_LogIdWarn, "Unable to map shared memory=%d/'%s'",
+            //      errno, strerror(errno));
+            shmheader = NULL;
+            continue;
+        }
+
+        header=&shmheader->header;
+
+        // The shared memory already existed. Wait until the magic
+        // is set (in case it was just created and not yet initialized).
+        while ((__atomic_load_n(&header->Magic, __ATOMIC_SEQ_CST) !=
+            AX_SHARED_MEM_MAGIC) && (getMonotonicOffset() < retryUntil)) {
+            UNTESTED();
+            usleep( 1 * 1000 );     /* 1ms */
+        }
+
+        if (unlikely(__atomic_load_n(&header->Magic, __ATOMIC_SEQ_CST) 
+            != AX_SHARED_MEM_MAGIC)) {
+            // The magic value isn't being set in a reasonable timeframe
+            // so let's assume this isn't our memory. There is no reason
+            // to retry any more because we got our shared memory region
+            // but the memory looks wrong, just give up.
+            UNTESTED();
+            (void)shmdt( shmheader );
+            shmheader = NULL;
+            break;
+        }
+
+        switch (header->HeaderVersion)  {
+        case AX_SHARED_MEM_LATEST_VERSION:
+            /* For now we only support one version */
+            break;
+
+        default: 
+            UNTESTED();
+            (void)shmdt( shmheader );
+            shmheader = NULL;
+            break;
+        }
+
+        num_ringsets=shmheader->directory.num_ringsets;
+        shmdt(shmheader); // drop the header mapping
+
+        // Great, it's probably OK. Get the full region.
+        unsigned long amt=sizeof(struct axrecvSharedMemoryHeader)+
+          num_ringsets*sizeof(struct axrecvAllRings);
+        shmId = shmget( AXRECV_SHMKEY, amt, AXSHM_PERMS );
+        if (shmId<0) {
+            usleep( 1 * 1000 );     /* 1ms */
+            continue;
+        }
+
+        // Now attach to shared memory.
+        shm = (struct axrecvSharedMemory *)shmat( shmId, NULL, 0 );
+        if((void *)shm == (void *)-1) {
+            UNTESTED();
+            //AXLOG(m_LogIdWarn, "Unable to map shared memory=%d/'%s'",
+            //      errno, strerror(errno));
+            shm = NULL;
+            continue;
+        }
+    }
+
+    // Did we time out or something?
+    if (shm == NULL) {
+        priv->shared_memory = NULL;
+        *PPAllRings = NULL;
+        return NULL;
+    } 
+
+    // Now figure out which ringset we will use.
+    int i,loops=0;
+    struct axrecvRingDirectory *dir=&shm->recvSharedMemory.directory;
+
+    // Walk through the directory and see if this process already has a ringset
+    char *cmdline=command_line_get();
+    int ringset=-1;
+    struct ringset_direntry *de;
+    for(i=0;i<num_ringsets;i++) {
+        de=&dir->ringsets[i];
+        if(strncmp(cmdline,de->owner_commandline,
+          RINGSET_OWNER_CMDLINE_MAX_LENGTH))
+            continue;
+        // the name matches, let's hope there's not already an owner!
+        if(de->owner_pid) {
+            // maybe it's dead?
+            int still_alive=1;
+            char path[256];
+            sprintf(path,"/proc/%d",de->owner_pid);
+            struct stat sb;
+            while(0==stat(path,&sb)) {
+                // other process is running, wait here.
+                if(loops%100==0) fprintf(stderr,
+                  "waiting for identically run process %d to exit\n",
+                  de->owner_pid);
+                usleep(100 * 1000); // 100ms
+                loops++;
+            }
+        }
+        ringset=i;
+        break;
+    }
+    // If it wasn't there then go through the ringsets and find a good slot or
+    // wait for one if there isn't one available
+    while(ringset==-1 && (getMonotonicOffset() < retryUntil)) {
+        for(i=0;i<num_ringsets;i++) {
+            de=&dir->ringsets[i];
+            if(de->owner_last_seen_time==0) {
+                ringset=i;
+                break;
+            }
+        }
+        if(ringset!=-1) break;
+
+        // Didn't find an empty slot, let's see if there's one to expire
+        for(i=0;i<num_ringsets;i++) {
+            de=&dir->ringsets[i];
+            struct stat sb;
+            char path[256];
+            // If the process that owns this slot has been gone for 10 minutes
+            // then we will presume it is dead.
+            sprintf(path,"/proc/%d",de->owner_pid);
+            if(stat(path,&sb)) { // it's gone!
+                int expiry_time=de->owner_last_seen_time+10*60;
+                if(time(NULL)>expiry_time) { // found a victim!
+                    ringset=i;
+                    break;
+                }
+            }
+        }
+        if(ringset!=-1) break;
+
+        // Didn't find one. Print periodically, and try again after a pause.
+        loops++;
+        if(loops%100==0) fprintf(stderr,
+            "waiting for shared memory ring slot to become available\n");
+        usleep(100 * 1000);
+    }
+    if(ringset==-1) { // didn't get one in time!
+        shmdt(shm);
+        priv->shared_memory=NULL;
+        return NULL;
+    }
+
+    // We are now the proud owner of ringset
+    de=&dir->ringsets[ringset];
+    de->owner_pid=getpid();
+    de->owner_last_seen_time=time(NULL);
+    strncpy(de->owner_commandline,cmdline,RINGSET_OWNER_CMDLINE_MAX_LENGTH);
+
+    unsigned ringIndex;
+    struct axrecvRing *pRing;
+    struct axrecvAllRings *pAllRings;
+
+    pAllRings=(struct axrecvAllRings *)&shm->recvSharedMemory.ringsets[ringset];
+
+    switch (header->DataVersion) {
+    case AXRECV_RING_DATA_VERSION:
+        break;
+
+    default:
+        /* This is an unknown/unsupported version so bail out */
+        (void)shmdt( shm );
+        shm = NULL;
+        pAllRings = NULL;
+        break;
+    }
+
+    *PPAllRings = pAllRings;
+
+    return shm;
+}
 
 /**
  * This will wait for there to be something to 'get'. It will timeout if there
@@ -103,6 +368,39 @@ ax_get_wait( pcap_t *PPcap, int64_t TimeoutNs ) {
     return( dataAvail );
 }
 
+static int
+shared_memory_open(pcap_t *pcap, int blocking) {
+    unsigned long devid;
+    struct AxPriv *priv=(struct AxPriv *)pcap->priv;
+    struct axrecvAllRings *rings;
+    char *end;
+
+    if(priv->shared_memory) return 0;
+
+    priv->shared_memory=openSharedMem(priv, &rings, blocking);
+    if(priv->shared_memory == NULL) {
+        pcap_cleanup_live_common( pcap );
+        return PCAP_ERROR;
+    }
+
+    /* Figure out which ring the user wants us to access */
+    devid = strtoul( &pcap->opt.device[8], &end, 10 );
+    if ((end == &pcap->opt.device[8]) || (*end != '\0') ||
+      (devid >= sizeof(rings->Ring)/sizeof(rings->Ring[0]))) {
+        snprintf(pcap->errbuf, PCAP_ERRBUF_SIZE,
+          "axellio error: ring buffer ID is invalid. device '%s'. "
+          "Valid range is 0..31.",pcap->opt.device);
+        (void)shmdt(priv->shared_memory);
+        pcap_cleanup_live_common(pcap);
+        return PCAP_ERROR_NO_SUCH_DEVICE;
+    }
+
+    /* We have validated devid so we can now setup our internal state */
+    priv->PRing = &rings->Ring[devid];
+
+    return 0; // success!
+}
+
 /**
  * This routine is called by the libpcap to read some number of packets. Each
  * packet is read from the shared memory and passed to libpcap via the PCb
@@ -121,7 +419,7 @@ ax_get_wait( pcap_t *PPcap, int64_t TimeoutNs ) {
 static int 
 ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
   u_char *PCbArg) {
-    struct AxPriv *pAx;
+    struct AxPriv *pAx=(struct AxPriv *)PPcap->priv;
     struct axrecvRing *pRing;
     int totalPackets;
     int64_t timeoutNs;
@@ -132,12 +430,16 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
     uint32_t pktLen;
     struct pcap_pkthdr pcapHdr;
 
-    /* Loop until we timeout or return a maximum defined number of packets */
-    pAx = (struct AxPriv *)PPcap->priv;
     if (unlikely(pAx == NULL)) {
         UNTESTED();
         return( -1 );
     }
+
+    if(0!=shared_memory_open(PPcap,pAx->NonBlock?0:1)) {
+        return 0; // can't open memory, return no data
+    }
+
+    /* Loop until we timeout or return a maximum defined number of packets */
     pRing = pAx->PRing;
     totalPackets = 0;
 
@@ -306,334 +608,13 @@ ax_close( pcap_t *PPcap ) {
 
     pAx = (struct AxPriv *)PPcap->priv;
     if (likely(pAx != NULL)) {
-        //pAx->PRing->GetState = 0;
         (void)shmdt( pAx->shared_memory );
         pAx->shared_memory = NULL;
+        pAx->PRing=NULL;
 
         /* After this, pAx is no longer valid */
         pcap_cleanup_live_common( PPcap );
         pAx = NULL;
-    }
-}
-
-static void 
-updateGid( int ShmId, const char *PGroupName ) {
-    struct shmid_ds ctrl;
-    int stat;
-    char *pNameBuf;
-    size_t nameBufSize;
-    struct group groupData;
-    struct group *pGroupResult;
-
-    /* Get the current settings */
-    stat = shmctl( ShmId, IPC_STAT, &ctrl );
-    if (stat < 0) {
-        UNTESTED();
-        //AXLOGTHROW(m_LogIdError, "UpdateGid() unable to check the current GID");
-        return;
-    }
-
-    /* Create some memory to return the strings in and attempt to get the group
-     * ID data we need. stat will be zero and pGroupResult will be non-NULL if
-     * we found the group data.
-     */
-    nameBufSize = 4*1024;
-    pNameBuf = (char *)malloc( nameBufSize );
-    pGroupResult = NULL;
-    stat = getgrnam_r( PGroupName, &groupData, pNameBuf, nameBufSize,
-      &pGroupResult );
-    if((stat != 0) || (pGroupResult == NULL)) {
-        /* Unable to find group, leave the shared memory group alone */
-    } else if (ctrl.shm_perm.gid != pGroupResult->gr_gid) {
-        /* IPC_SET allows us to change shm_perm.uid, shm_perm.gid, and (the
-         * least significant 9 bits of) shm_perm.mode.
-         */
-        ctrl.shm_perm.gid = pGroupResult->gr_gid;
-        stat = shmctl( ShmId, IPC_SET, &ctrl );
-    }
-    free( pNameBuf );
-}
-
-char *
-command_line_get(void) {
-    static char cmdline[RINGSET_OWNER_CMDLINE_MAX_LENGTH];
-    char file[256];
-    int len,i;
-    sprintf(file,"/proc/%d/cmdline",getpid());
-    int fd=open(file,O_RDONLY);
-    if(fd<0) {
-        perror("open cmdline");
-        return NULL;
-    }
-    len=read(fd,cmdline,2047);
-    if(len<0) {
-        close(fd);
-        perror("read cmdline");
-        return NULL;
-    }
-    for(i=0;i<len-1;i++) {
-        if(cmdline[i]=='\0') cmdline[i]=' ';
-    }
-    close(fd);
-    return cmdline;
-}
-
-// // Get a pointer to the shared memory ring directory. Create said directory
-// // if necessary.
-// static struct axrecvRingDirectory *
-// directory_get(void) {
-//     static struct axrecvRingDirectory *dir=NULL;
-//     int needs_init=0;
-//     if(dir) return dir;
-
-//     int shmid;
-//     do {
-//         shmid=shmget(AXRECV_DIRECTORY_SHMKEY,
-//           sizeof(struct axrecvRingDirectory),IPC_CREAT|IPC_EXCL|AXSHM_PERMS);
-//         if(shmid>=0) { // successfully created
-//             needs_init=1;
-//             break;
-//         }
-//         // Didn't create it -- either it exists or ???
-//         if(errno==EEXIST) {
-//             shmid=shmget(AXRECV_DIRECTORY_SHMKEY,
-//               sizeof(struct axrecvRingDirectory),AXSHM_PERMS);
-//             if(shmid>=0) {
-//                 needs_init=0;
-//                 break;
-//             }
-//             UNTESTED();
-//         }
-
-//         UNTESTED();
-//         usleep(100*1000);
-//     } while(!dir);
-
-//     dir=(struct axrecvRingDirectory *)shmat(shmid,NULL,0);
-//     if(dir==(struct axrecvRingDirectory *)-1) {
-//         printf("shmid=%x\n",shmid);
-//         perror("pxrecv directory attach");
-//         UNTESTED();
-//         exit(0);
-//     }
-
-//     if(needs_init) {
-//         memset(dir,0,sizeof(struct axrecvRingDirectory));
-//     }
-
-//     return dir;
-// }
-
-/**
- * @param Pshared_memory - Returns the handle used to free the shared memory.
- * @param PPAllRings - Returns the handle to the ring buffers.
- */
-static void 
-openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings ) {
-    struct axrecvSharedMemory *shm=NULL;
-    struct AxSharedMemHeader_v1 *header;
-    int shmId;
-    size_t shmSize;
-    int needInit;
-    int64_t retryUntil;
-
-printf("header:%d rings: %d\n",sizeof(struct AxSharedMemHeader_v1),sizeof(struct axrecvAllRings));
-printf("BLOB: %u\n",sizeof(struct axrecvSharedMemory));
-    shmSize=sizeof(struct axrecvSharedMemory);
-    retryUntil = getMonotonicOffset() + (250LL * 1000000LL);
-    do {
-        needInit = 0;
-        do {
-            // Try to create the shared memory in exclusive mode. This will fail
-            // if the memory is already created.
-            shmId=shmget(AXRECV_SHMKEY,shmSize,IPC_CREAT|IPC_EXCL|
-              AXSHM_PERMS);
-            if (shmId >= 0) {
-                needInit = 1;
-                break;
-            }
-
-            // We had an error creating the shared memory. If the memory already
-            // exists then we can just attach to it and we don't need to
-            // initialize it at all.
-            if (errno == EEXIST) {
-                shmId = shmget( AXRECV_SHMKEY, shmSize, AXSHM_PERMS );
-                            perror("shmget");
-                if (shmId >= 0) {
-                    needInit = 0;
-                    break;
-                }
-            }
-
-            // EACCES is a permission issue. We do want to keep retrying because
-            // the permission might be being granted while we are trying.
-            UNTESTED();
-            usleep( 1 * 1000 );     /* 1ms */
-        } while ((shmId < 0) && (getMonotonicOffset() < retryUntil));
-
-        /* If the shared memory was found then attach it */
-        if (shmId >= 0) {
-            shm = (struct axrecvSharedMemory *)shmat( shmId, NULL, 0 );
-            if ((void *)shm == (void *)-1) {
-                UNTESTED();
-                //AXLOG(m_LogIdWarn, "Unable to map shared memory=%d/'%s'",
-                //      errno, strerror(errno));
-                shm = NULL;
-                continue;
-            }
-
-            header=&shm->header;
-
-            if (needInit) {
-                // When shared memory is created, the memory is set to zero.
-                // Initialize the memory and set the magic value last.
-                header->HeaderVersion = AX_SHARED_MEM_LATEST_VERSION;
-                __atomic_store_n( &header->Magic, AX_SHARED_MEM_MAGIC,
-                  __ATOMIC_SEQ_CST );
-            } else {
-                // The shared memory already existed. Wait until the magic
-                // is set (in case it was just created and not yet initialized).
-                while ((__atomic_load_n(&header->Magic, __ATOMIC_SEQ_CST) !=
-                  AX_SHARED_MEM_MAGIC) && (getMonotonicOffset() < retryUntil)) {
-                    UNTESTED();
-                    usleep( 1 * 1000 );     /* 1ms */
-                }
-
-                if (unlikely(__atomic_load_n(&header->Magic, __ATOMIC_SEQ_CST) 
-                  != AX_SHARED_MEM_MAGIC)) {
-                    // The magic value isn't being set in a reasonable timeframe
-                    // so let's assume this isn't our memory. There is no reason
-                    // to retry any more because we got our shared memory region
-                    // but the memory looks wrong, just give up.
-                    UNTESTED();
-                    (void)shmdt( shm );
-                    shm = NULL;
-                    break;
-                }
-
-                switch (header->HeaderVersion)  {
-                case AX_SHARED_MEM_LATEST_VERSION:
-                    /* For now we only support one version */
-                    break;
-
-                default: 
-                    UNTESTED();
-                    (void)shmdt( shm );
-                    shm = NULL;
-                    break;
-                }
-            }
-            break;
-        }
-        UNTESTED();
-        shmId = -1;
-        shm = NULL;
-    } while ((shm == NULL) && (getMonotonicOffset() < retryUntil));
-
-    if (shm == NULL) {
-        UNTESTED();
-        priv->shared_memory = NULL;
-        *PPAllRings = NULL;
-        // we're going to crash very soon.
-        return;
-    } 
-
-    int i,loops=0;
-
-    // First we need to figure out where our rings are. If they don't exist
-    // then we will create them.
-    struct axrecvRingDirectory *dir=&shm->recvSharedMemory.directory;
-
-    // Walk through the directory and see if this process already has a ring
-    char *cmdline=command_line_get();
-    printf("cmdline is %s\n",cmdline);
-    int ringset=-1;
-    struct ringset_direntry *de;
-    for(i=0;i<MAX_NUM_RINGSETS;i++) {
-        de=&dir->ringsets[i];
-        if(strncmp(cmdline,de->owner_commandline,
-          RINGSET_OWNER_CMDLINE_MAX_LENGTH))
-            continue;
-        // the name matches, let's hope there's not already an owner!
-        if(de->owner_pid) {
-            // maybe it's dead?
-            int still_alive=1;
-            char path[256];
-            sprintf(path,"/proc/%d",de->owner_pid);
-            struct stat sb;
-            while(0==stat(path,&sb)) {
-                // other process is running, wait here.
-                if(loops%100==0) fprintf(stderr,
-                  "waiting for identically run process %d to exit\n",
-                  de->owner_pid);
-                usleep(100 * 1000); // 100ms
-                loops++;
-            }
-        }
-        ringset=i;
-        break;
-    }
-    // If it wasn't there then go through the ringsets and find a good slot
-    while(ringset==-1) {
-        for(i=0;i<MAX_NUM_RINGSETS;i++) {
-            de=&dir->ringsets[i];
-            if(de->owner_last_seen_time==0) {
-                ringset=i;
-                break;
-            }
-            // TODO - expire slots that haven't been used lately
-        }
-        if(ringset!=-1) break;
-        loops++;
-        if(loops%100==0) fprintf(stderr,
-            "waiting for shared memory ring slot to become available\n");
-        usleep(100 * 1000);
-    }
-    // We are now the proud owner of ringset
-    de=&dir->ringsets[ringset];
-    de->owner_pid=getpid();
-    de->owner_last_seen_time=time(NULL);
-    strncpy(de->owner_commandline,cmdline,RINGSET_OWNER_CMDLINE_MAX_LENGTH);
-printf("We are in ringset %d\n",ringset);
-
-    unsigned ringIndex;
-    struct axrecvRing *pRing;
-    struct axrecvAllRings *pAllRings;
-
-    pAllRings = (struct axrecvAllRings *)&shm->recvSharedMemory.ringsets[ringset];
-    if (needInit) {
-        // If we need to initialize then we need to make sure the group is
-        // setup the way we want.
-        updateGid( shmId, "apcnoperators" );
-
-        header->DataVersion = AXRECV_RING_DATA_VERSION;
-
-        for (ringIndex = 0, pRing = &pAllRings->Ring[0];
-            ringIndex < sizeof(pAllRings->Ring)/sizeof(pAllRings->Ring[0]);
-            ringIndex++, pRing++) {
-            pAllRings->Ring[ringIndex].Put = 0;
-            pAllRings->Ring[ringIndex].PutPackets = 0;
-            pAllRings->Ring[ringIndex].PutFlushes = 0;
-
-            pAllRings->Ring[ringIndex].Get = 0;
-            pAllRings->Ring[ringIndex].GetPackets = 0;
-            pAllRings->Ring[ringIndex].GetState = 0;
-        }
-    } else {
-        switch (header->DataVersion) {
-        case AXRECV_RING_DATA_VERSION:
-            break;
-
-        default:
-            /* This is an unknown/unsupported version so bail out */
-            (void)shmdt( shm );
-            shm = NULL;
-            pAllRings = NULL;
-            break;
-        }
-
-        priv->shared_memory = shm;
-        *PPAllRings = pAllRings;
     }
 }
 
@@ -649,37 +630,8 @@ printf("We are in ringset %d\n",ringset);
  */
 static int 
 ax_activate( pcap_t *PPcap ) {
-    struct AxPriv *pAx;
-    struct axrecvAllRings *pAllRings;
-    unsigned long devId;
-    char *pEnd;
-
     /* Start to setup our private data structure */
-    pAx = (struct AxPriv *)PPcap->priv;
-    openSharedMem( pAx, &pAllRings );
-    if (pAx->shared_memory == NULL) {
-        pcap_cleanup_live_common( PPcap );
-        return( PCAP_ERROR );
-    }
-
-    /* Figure out which ring the user wants us to access */
-    devId = strtoul( &PPcap->opt.device[8], &pEnd, 10 );
-    if ((pEnd == &PPcap->opt.device[8]) || (*pEnd != '\0') ||
-      (devId >= sizeof(pAllRings->Ring)/sizeof(pAllRings->Ring[0]))) {
-        snprintf(PPcap->errbuf, PCAP_ERRBUF_SIZE,
-                 "axellio error: ring buffer ID is invalid. device '%s'. "
-                 "Valid range is 0..31.",
-                 PPcap->opt.device);
-
-        (void)shmdt( pAx->shared_memory );
-        pcap_cleanup_live_common( PPcap );
-        return( PCAP_ERROR_NO_SUCH_DEVICE );
-    }
-
-    /* We have validated devId so we can now setup our internal state */
-    pAx->PRing = &pAllRings->Ring[ devId ];
-    //pAx->SegOffset = 0;
-    //pAx->PRing->GetState = 1;   //mark in use
+    struct AxPriv *pAx = (struct AxPriv *)PPcap->priv;
 
     pAx->NonBlock = 0;
     pAx->PacketsRx = 0;
@@ -776,7 +728,7 @@ pcap_axellio_findalldevs( pcap_if_list_t *PDevList, char *PErrorBuf ) {
     char desc[64];
     struct AxPriv private;
 
-    openSharedMem( &private, &pAllRings );
+    private.shared_memory=openSharedMem( &private, &pAllRings, 1 );
     if (private.shared_memory == NULL) {
         UNTESTED();
         return( 0 );
