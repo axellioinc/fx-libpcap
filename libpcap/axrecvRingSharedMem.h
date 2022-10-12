@@ -159,7 +159,7 @@ public:
 
     // Initialize the shared memory. This routine will throw if it has any
     // issues mapping the shared memory.
-    void Initialize(unsigned ringset);
+    void Initialize(unsigned ringset, unsigned num_ringsets);
 
     // This will return a pointer to the specific ring requested.
     //
