@@ -2,5 +2,4 @@
 
 ### Build HOWTO
 
-cd libpcap-1.9.1
-make -f Makefile-rpm
+cd libpcap-1.9.1 && make -f Makefile-rpm
