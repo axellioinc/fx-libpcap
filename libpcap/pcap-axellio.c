@@ -209,6 +209,7 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
     if (shm == NULL) {
         priv->shared_memory = NULL;
         *PPAllRings = NULL;
+        fprintf(stderr,"fx-libpcap timeout opening shared memory\n");
         return NULL;
     } 
 
@@ -227,18 +228,27 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
             continue;
         // the name matches, let's hope there's not already an owner!
         if(de->owner_pid) {
-            // maybe it's dead?
-            int still_alive=1;
-            char path[256];
-            sprintf(path,"/proc/%d",de->owner_pid);
-            struct stat sb;
-            while(0==stat(path,&sb)) {
-                // other process is running, wait here.
-                if(loops%100==0) fprintf(stderr,
-                  "waiting for identically run process %d to exit\n",
-                  de->owner_pid);
-                usleep(100 * 1000); // 100ms
-                loops++;
+            if(de->owner_pid!=getpid()) {
+                // maybe it's dead?
+                int still_alive=1;
+                char path[256];
+                sprintf(path,"/proc/%d",de->owner_pid);
+                struct stat sb;
+                while(0==stat(path,&sb)) {
+                    // other process is running, wait here.
+                    if(loops%100==0) {
+                        fprintf(stderr,
+                        "waiting for identically run process %d to exit\n",
+                        de->owner_pid);
+                        fprintf(stderr,"I am %s[%d], other is %s[%d]\n",cmdline,
+                        getpid(),de->owner_commandline,de->owner_pid);
+                    }
+                    usleep(100 * 1000); // 100ms
+                    loops++;
+                }
+            } else {
+                printf("reopening %d from same pid, I am %s[%d]\n",i,
+                  cmdline,de->owner_pid);
             }
         }
         ringset=i;
@@ -267,10 +277,12 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
             if(stat(path,&sb)) { // it's gone!
                 int expiry_time=de->owner_last_seen_time+10*60;
                 if(time(NULL)>expiry_time) { // found a victim!
+                    fprintf(stderr,"EXPIRING ringset %d owned by %s[%d]\n",i,de->owner_commandline,de->owner_pid);
                     ringset=i;
                     break;
                 }
             }
+            fprintf(stderr,"can't steal ringset %d owned by %s[%d]\n",i,de->owner_commandline,de->owner_pid);
         }
         if(ringset!=-1) break;
 
@@ -283,6 +295,7 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
     if(ringset==-1) { // didn't get one in time!
         shmdt(shm);
         priv->shared_memory=NULL;
+        fprintf(stderr,"fxlibpcap timeout getting ringset\n");
         return NULL;
     }
 
@@ -291,6 +304,7 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
     de->owner_pid=getpid();
     de->owner_last_seen_time=time(NULL);
     strncpy(de->owner_commandline,cmdline,RINGSET_OWNER_CMDLINE_MAX_LENGTH);
+    fprintf(stderr,"RINGSET %d assigned to %s[%d]\n",ringset,de->owner_commandline,de->owner_pid);
 
     unsigned ringIndex;
     struct axrecvRing *pRing;
