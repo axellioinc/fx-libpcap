@@ -29,6 +29,7 @@ cp -a * %{buildroot}
 
 
 %files
+/opt/axellio/config/fx-libpcap.ini
 /usr/lib/pkgconfig/libpcap.pc
 /usr/lib/libpcap.so.1.9.1
 /usr/lib/libpcap.so.1

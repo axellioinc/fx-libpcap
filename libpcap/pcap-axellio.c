@@ -9,6 +9,8 @@
 #include <time.h>       //clock_gettime
 #include <grp.h>        //getgrnam_r
 #include <fcntl.h>
+#include <regex.h>
+#include <ctype.h>
 
 #include "pcap-int.h"
 #include "pcap-axellio.h"
@@ -49,6 +51,133 @@ getMonotonicOffset() {
     (void)clock_gettime( CLOCK_MONOTONIC, &ts );
     return( (ts.tv_sec * 1000000000LL) + ts.tv_nsec );
 }
+
+struct option {
+	struct option *next;
+	char name[80];
+	char value[300];
+};
+
+struct section {
+	struct section *next;
+	struct option *options;
+	char name[80];
+};
+
+struct config {
+	struct section *sections;
+};
+
+char *
+trim(char *str) {
+	char *end;
+	// Trim leading space
+	while(isspace((unsigned char)*str)) str++;
+	if(*str == 0)  // All spaces?
+		return str;
+	// Trim trailing space
+	end = str + strlen(str) - 1;
+	while(end > str && isspace((unsigned char)*end)) end--;
+	// Write new null terminator character
+	end[1] = '\0';
+	return str;
+}
+
+struct section *
+section_get(char *name, struct config *config, int create) {
+	struct section *section=config->sections;
+	struct section *last_section=NULL;
+	if(name==NULL) name="";
+	while(section) {
+		if(!strcasecmp(name,section->name)) return section;
+		last_section=section;
+		section=section->next;
+	}
+	if(!create) return NULL;
+	section=malloc(sizeof(struct section));
+	strcpy(section->name,name);
+	section->next=NULL;
+	section->options=NULL;
+	if(last_section) {
+		last_section->next=section;
+	} else {
+		config->sections=section;
+	}
+	return section;
+}
+
+struct option *
+option_get(char *name, struct section *section, int create) {
+	struct option *option=section->options;
+	struct option *last_option=NULL;
+	while(option) {
+		if(!strcasecmp(name,option->name)) return option;
+		last_option=option;
+		option=option->next;
+	}
+	if(!create) return NULL;
+	option=malloc(sizeof(struct option));
+	strcpy(option->name,name);
+	option->next=NULL;
+	option->value[0]='\0';
+	if(last_option) {
+		last_option->next=option;
+	} else {
+		section->options=option;
+	}
+	return option;
+}
+
+int
+config_readfile(char *file, struct config *options) {
+	FILE *fp=fopen(file,"r");
+	if(!fp) {
+		perror("can't open");
+		return -errno;
+	}
+	struct section *section=section_get("",options,1);
+	char line[500];
+	while(NULL!=fgets(line,500,fp)) {
+		char *p=trim(line);
+		if(p[0]=='#') { //comment
+			continue;
+		}
+		if(p[0]=='[') { // new section
+			char *close_bracket=strchr(&p[1],']');
+			if(!close_bracket) { // :(
+				fprintf(stderr,"no bracket closure: %s\n",p);
+				continue;
+			}
+			*close_bracket='\0';
+			p++;
+			section=section_get(p,options,1);
+			continue;
+		}
+		char *equals=strchr(p,'=');
+		if(!equals) {
+			if(strlen(p))
+				fprintf(stderr,"no value defined: %s\n",p);
+			continue;
+		}
+		*equals='\0';
+		char *name=trim(p);
+		struct option *option=option_get(name,section,1);
+		char *value=trim(equals+1);
+		strcpy(option->value,value);
+	}
+	fclose(fp);
+	return 0;
+}
+
+char *
+config_get(char *section_name,char *option_name, struct config *config) {
+	struct section *section=section_get(section_name,config,0);
+	if(!section) return NULL;
+	struct option *option=option_get(option_name,section,0);
+	if(!option) return NULL;
+	return option->value;
+}
+
 // Get the commandline of this application
 static char *
 command_line_get(void) {
@@ -110,6 +239,143 @@ updateGid( int ShmId, const char *PGroupName ) {
         stat = shmctl( ShmId, IPC_SET, &ctrl );
     }
     free( pNameBuf );
+}
+
+int
+ringset_select_pidandname(struct axrecvSharedMemory *shm, int num_ringsets, 
+  int64_t deadline, struct config *config) {
+    int i,loops=0;
+    struct axrecvRingDirectory *dir=&shm->recvSharedMemory.directory;
+
+    // Walk through the directory and see if this process already has a ringset
+    char *cmdline=command_line_get();
+    int ringset=-1;
+    struct ringset_direntry *de;
+    for(i=0;i<num_ringsets;i++) {
+        de=&dir->ringsets[i];
+        if(strncmp(cmdline,de->owner_commandline,
+          RINGSET_OWNER_CMDLINE_MAX_LENGTH))
+            continue;
+        // the name matches, let's hope there's not already an owner!
+        if(de->owner_pid) {
+            if(de->owner_pid!=getpid()) {
+                // maybe it's dead?
+                int still_alive=1;
+                char path[256];
+                sprintf(path,"/proc/%d",de->owner_pid);
+                struct stat sb;
+                while(0==stat(path,&sb)) {
+                    // other process is running, wait here.
+                    if(loops%100==0) {
+                        fprintf(stderr,
+                        "waiting for identically run process %d to exit\n",
+                        de->owner_pid);
+                        fprintf(stderr,"I am %s[%d], other is %s[%d]\n",cmdline,
+                        getpid(),de->owner_commandline,de->owner_pid);
+                    }
+                    usleep(100 * 1000); // 100ms
+                    loops++;
+                }
+            } else {
+                printf("reopening %d from same pid, I am %s[%d]\n",i,
+                  cmdline,de->owner_pid);
+            }
+        }
+        return i;
+    }
+
+    // If it wasn't there then go through the ringsets and find a good slot or
+    // wait for one if there isn't one available
+    while(ringset==-1 && (getMonotonicOffset() < deadline)) {
+        for(i=0;i<num_ringsets;i++) {
+            de=&dir->ringsets[i];
+            if(de->owner_last_seen_time==0) {
+                return i;
+            }
+        }
+
+        // Didn't find an empty slot, let's see if there's one to expire
+        for(i=0;i<num_ringsets;i++) {
+            de=&dir->ringsets[i];
+            struct stat sb;
+            char path[256];
+            // If the process that owns this slot has been gone for 10 minutes
+            // then we will presume it is dead.
+            sprintf(path,"/proc/%d",de->owner_pid);
+            if(stat(path,&sb)) { // it's gone!
+                int expiry_time=de->owner_last_seen_time+10*60;
+                if(time(NULL)>expiry_time) { // found a victim!
+                    fprintf(stderr,"EXPIRING ringset %d owned by %s[%d]\n",i,de->owner_commandline,de->owner_pid);
+                    return i;
+                }
+            }
+            fprintf(stderr,"can't steal ringset %d owned by %s[%d]\n",i,de->owner_commandline,de->owner_pid);
+        }
+
+        // Didn't find one. Print periodically, and try again after a pause.
+        loops++;
+        if(loops%100==0) fprintf(stderr,
+            "waiting for shared memory ring slot to become available\n");
+        usleep(100 * 1000);
+    }
+    return -1;
+}
+
+int
+regex_check(char *expression, char *value) {
+    regex_t regex;
+    int ret;
+    // compile the regular expression
+    ret=regcomp(&regex,expression,0);
+    if(ret!=0) {
+        fprintf(stderr,"%s: can't compile regular expression '%s': %s\n",
+          __func__,expression,strerror(errno));
+        return -1;
+    }
+    // evaluate the expression
+    ret=regexec(&regex,value,0,NULL,0);
+    return ret;
+}
+
+int
+ringset_select_by_regex(struct axrecvSharedMemory *shm, int num_ringsets, 
+  int64_t deadline, struct config *config) {
+    int ret;
+    char *cmdline=command_line_get();
+    char option_name[100];
+    int ringset;
+
+    for(ringset=0;ringset<num_ringsets;ringset++) {
+        sprintf(option_name,"ringset_%d_regex",ringset);
+        char *regex=config_get(NULL,option_name,config);
+        if(!regex) continue;
+
+        ret=regex_check(regex,cmdline);
+        if(ret!=0) continue;
+        fprintf(stderr,"%s: matched %s: %s[%d]\n",__func__,regex,cmdline,getpid());
+        return ringset;
+    }
+
+    return -1;
+}
+
+int
+ringset_select(struct axrecvSharedMemory *shm, int num_ringsets, 
+  int64_t deadline) {
+    static struct config *config=NULL;
+    if(!config) {
+        int ret;
+        config=malloc(sizeof(struct config));
+        memset(config,0,sizeof(config));
+        ret=config_readfile("/opt/axellio/config/fx-libpcap.ini",config);
+        ret=config_readfile("/opt/axellio/config/px-libpcap.ini",config);
+        // ignore ret....!?!
+    }
+    int ringset;
+    ringset=ringset_select_by_regex(shm,num_ringsets,deadline,config);
+    if(ringset!=-1) return ringset;
+    ringset=ringset_select_pidandname(shm,num_ringsets,deadline,config);
+    return ringset;
 }
 
 /**
@@ -182,6 +448,19 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
             break;
         }
 
+        switch (header->DataVersion) {
+        case AXRECV_RING_DATA_VERSION:
+            break;
+
+        default:
+            /* This is an unknown/unsupported version so bail out */
+            fprintf(stderr,"header->DataVersion %d (expected %d)\n",
+            header->DataVersion,AXRECV_RING_DATA_VERSION);
+            (void)shmdt( shmheader );
+            shmheader = NULL;
+            break;
+        }
+
         num_ringsets=shmheader->directory.num_ringsets;
         shmdt(shmheader); // drop the header mapping
 
@@ -214,84 +493,8 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
     } 
 
     // Now figure out which ringset we will use.
-    int i,loops=0;
-    struct axrecvRingDirectory *dir=&shm->recvSharedMemory.directory;
-
-    // Walk through the directory and see if this process already has a ringset
-    char *cmdline=command_line_get();
-    int ringset=-1;
-    struct ringset_direntry *de;
-    for(i=0;i<num_ringsets;i++) {
-        de=&dir->ringsets[i];
-        if(strncmp(cmdline,de->owner_commandline,
-          RINGSET_OWNER_CMDLINE_MAX_LENGTH))
-            continue;
-        // the name matches, let's hope there's not already an owner!
-        if(de->owner_pid) {
-            if(de->owner_pid!=getpid()) {
-                // maybe it's dead?
-                int still_alive=1;
-                char path[256];
-                sprintf(path,"/proc/%d",de->owner_pid);
-                struct stat sb;
-                while(0==stat(path,&sb)) {
-                    // other process is running, wait here.
-                    if(loops%100==0) {
-                        fprintf(stderr,
-                        "waiting for identically run process %d to exit\n",
-                        de->owner_pid);
-                        fprintf(stderr,"I am %s[%d], other is %s[%d]\n",cmdline,
-                        getpid(),de->owner_commandline,de->owner_pid);
-                    }
-                    usleep(100 * 1000); // 100ms
-                    loops++;
-                }
-            } else {
-                printf("reopening %d from same pid, I am %s[%d]\n",i,
-                  cmdline,de->owner_pid);
-            }
-        }
-        ringset=i;
-        break;
-    }
-    // If it wasn't there then go through the ringsets and find a good slot or
-    // wait for one if there isn't one available
-    while(ringset==-1 && (getMonotonicOffset() < retryUntil)) {
-        for(i=0;i<num_ringsets;i++) {
-            de=&dir->ringsets[i];
-            if(de->owner_last_seen_time==0) {
-                ringset=i;
-                break;
-            }
-        }
-        if(ringset!=-1) break;
-
-        // Didn't find an empty slot, let's see if there's one to expire
-        for(i=0;i<num_ringsets;i++) {
-            de=&dir->ringsets[i];
-            struct stat sb;
-            char path[256];
-            // If the process that owns this slot has been gone for 10 minutes
-            // then we will presume it is dead.
-            sprintf(path,"/proc/%d",de->owner_pid);
-            if(stat(path,&sb)) { // it's gone!
-                int expiry_time=de->owner_last_seen_time+10*60;
-                if(time(NULL)>expiry_time) { // found a victim!
-                    fprintf(stderr,"EXPIRING ringset %d owned by %s[%d]\n",i,de->owner_commandline,de->owner_pid);
-                    ringset=i;
-                    break;
-                }
-            }
-            fprintf(stderr,"can't steal ringset %d owned by %s[%d]\n",i,de->owner_commandline,de->owner_pid);
-        }
-        if(ringset!=-1) break;
-
-        // Didn't find one. Print periodically, and try again after a pause.
-        loops++;
-        if(loops%100==0) fprintf(stderr,
-            "waiting for shared memory ring slot to become available\n");
-        usleep(100 * 1000);
-    }
+    int ringset;
+    ringset=ringset_select(shm,num_ringsets,retryUntil);
     if(ringset==-1) { // didn't get one in time!
         shmdt(shm);
         priv->shared_memory=NULL;
@@ -300,31 +503,15 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
     }
 
     // We are now the proud owner of ringset
+    struct axrecvRingDirectory *dir=&shm->recvSharedMemory.directory;
+    struct ringset_direntry *de;
+    char *cmdline=command_line_get();
     de=&dir->ringsets[ringset];
     de->owner_pid=getpid();
     de->owner_last_seen_time=time(NULL);
     strncpy(de->owner_commandline,cmdline,RINGSET_OWNER_CMDLINE_MAX_LENGTH);
-    fprintf(stderr,"RINGSET %d assigned to %s[%d]\n",ringset,de->owner_commandline,de->owner_pid);
 
-    unsigned ringIndex;
-    struct axrecvRing *pRing;
-    struct axrecvAllRings *pAllRings;
-
-    pAllRings=(struct axrecvAllRings *)&shm->recvSharedMemory.ringsets[ringset];
-
-    switch (header->DataVersion) {
-    case AXRECV_RING_DATA_VERSION:
-        break;
-
-    default:
-        /* This is an unknown/unsupported version so bail out */
-        (void)shmdt( shm );
-        shm = NULL;
-        pAllRings = NULL;
-        break;
-    }
-
-    *PPAllRings = pAllRings;
+    *PPAllRings=(struct axrecvAllRings *)&shm->recvSharedMemory.ringsets[ringset];
 
     return shm;
 }
@@ -450,6 +637,7 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
     }
 
     if(0!=shared_memory_open(PPcap,pAx->NonBlock?0:1)) {
+        fprintf(stderr,"%s Unable to open shared memory\n",__func__);
         return 0; // can't open memory, return no data
     }
 
@@ -474,6 +662,8 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
         /* The pcap library will set this flag to stop us */
         if (unlikely(PPcap->break_loop)) {
             PPcap->break_loop = 0;
+            fprintf(stderr,"%s exit PCAP_ERROR_BREAK\n");
+            fflush(stderr);
             return( PCAP_ERROR_BREAK );
         }
 
@@ -658,7 +848,6 @@ ax_activate( pcap_t *PPcap ) {
     PPcap->fd = -1;
     //PPcap->priv;
     if ((PPcap->snapshot <= 0) || (PPcap->snapshot > MAXIMUM_SNAPLEN)) {
-        UNTESTED();
         PPcap->snapshot = MAXIMUM_SNAPLEN;
     }
 
