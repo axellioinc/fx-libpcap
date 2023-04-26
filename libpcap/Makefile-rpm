@@ -22,6 +22,8 @@ rpm:
 #	rm -rf $(BUILD_DIR)/sandbox
 #	mkdir -p $(BUILD_DIR)/sandbox/fx-libpcap-$(VERSION)/usr
 #	cp -r $(PREFIX_DIR)/* $(BUILD_DIR)/sandbox/fx-libpcap-$(VERSION)/usr/
+	mkdir -p $(BUILD_DIR)/sandbox/fx-libpcap-$(VERSION)/opt/axellio/config
+	cp fx-libpcap.ini $(BUILD_DIR)/sandbox/fx-libpcap-$(VERSION)/opt/axellio/config/
 	tar czf $(BUILD_DIR)/SOURCES/fx-libpcap-$(VERSION).tar.gz -C $(BUILD_DIR)/sandbox/ fx-libpcap-$(VERSION)/
 	cd $(BUILD_DIR)
 	rpmbuild --quiet --define "_topdir $(BUILD_DIR)" -bb $(BUILD_DIR)/SPECS/fx-libpcap.spec

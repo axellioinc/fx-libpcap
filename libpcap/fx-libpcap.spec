@@ -4,7 +4,7 @@
 
 Name:		fx-libpcap
 Version:	_VERSION_
-Release:	1%{?dist}
+Release:	3%{?dist}
 Summary:	Axellio PacketXpress libpcap integration
 
 License:	GPL
@@ -29,6 +29,7 @@ cp -a * %{buildroot}
 
 
 %files
+/opt/axellio/config/fx-libpcap.ini
 /usr/lib/pkgconfig/libpcap.pc
 /usr/lib/libpcap.so.1.9.1
 /usr/lib/libpcap.so.1
