@@ -11,11 +11,39 @@
 #include <fcntl.h>
 #include <regex.h>
 #include <ctype.h>
+#include <pthread.h>
+#include <stdarg.h>
 
 #include "pcap-int.h"
 #include "pcap-axellio.h"
 
 #define UNTESTED()  fprintf(stderr, "UNTESTED %s:%d\n", __FILE__, __LINE__);
+
+// EDEBUG is a facility for debugging fx-libpcap through files in /tmp
+// Output from ELOG() will go into /tmp/surilog as a text file
+#define EDEBUG 0
+#define ELOG(...) if(EDEBUG) do_elog(__LINE__,__VA_ARGS__);
+
+static void do_elog(int line, char *fmt, ...) {
+    va_list ap;
+    static FILE *fp=NULL;
+    static pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER;
+
+    va_start(ap,fmt);
+    pthread_mutex_lock(&mutex);
+    if(!fp) {
+        char fname[200];
+        mkdir("/tmp/surilog",S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+        sprintf(fname,"/tmp/surilog/fxlibpcap%d.log",getpid());
+        fp=fopen(fname,"a");
+    }
+    fprintf(fp,"%d:",line);
+    vfprintf(fp,fmt,ap);
+    fprintf(fp,"\n");
+    fflush(fp);
+    pthread_mutex_unlock(&mutex);
+    va_end(ap);
+}
 
 // This is our stateful information passed to us by pcap
 struct AxPriv {
@@ -394,6 +422,8 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
 
     retryUntil = getMonotonicOffset() + (250LL * 1000000LL);
 
+    ELOG("%s %d",__func__,__LINE__);
+
     // Map the shared memory.
     while((shm == NULL) && (getMonotonicOffset() < retryUntil)) {
         // Try to get the shared memory header region ONLY.
@@ -403,6 +433,7 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
             usleep( 1 * 1000 );     /* 1ms */
             continue;
         }
+        ELOG("%s got shmId %d",__func__,shmId);
 
         // Now attach to shared memory.
         shmheader = (struct axrecvSharedMemoryHeader *)shmat( shmId, NULL, 0 );
@@ -463,6 +494,7 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
 
         num_ringsets=shmheader->directory.num_ringsets;
         shmdt(shmheader); // drop the header mapping
+        ELOG("%s %d ringsets",__func__,num_ringsets);
 
         // Great, it's probably OK. Get the full region.
         unsigned long amt=sizeof(struct axrecvSharedMemoryHeader)+
@@ -472,6 +504,7 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
             usleep( 1 * 1000 );     /* 1ms */
             continue;
         }
+        ELOG("%s shmId %d",__func__,shmId);
 
         // Now attach to shared memory.
         shm = (struct axrecvSharedMemory *)shmat( shmId, NULL, 0 );
@@ -482,12 +515,14 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
             shm = NULL;
             continue;
         }
+        ELOG("%s shmat %p",__func__,shm);
     }
 
     // Did we time out or something?
     if (shm == NULL) {
         priv->shared_memory = NULL;
         *PPAllRings = NULL;
+        ELOG("%s timeout",__func__);
         fprintf(stderr,"fx-libpcap timeout opening shared memory\n");
         return NULL;
     } 
@@ -495,6 +530,7 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
     // Now figure out which ringset we will use.
     int ringset;
     ringset=ringset_select(shm,num_ringsets,retryUntil);
+    ELOG("%s ringset=%d",__func__,ringset);
     if(ringset==-1) { // didn't get one in time!
         shmdt(shm);
         priv->shared_memory=NULL;
@@ -512,6 +548,7 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
     strncpy(de->owner_commandline,cmdline,RINGSET_OWNER_CMDLINE_MAX_LENGTH);
 
     *PPAllRings=(struct axrecvAllRings *)&shm->recvSharedMemory.ringsets[ringset];
+    ELOG("%s PPAll %p",__func__,*PPAllRings);
 
     return shm;
 }
@@ -540,6 +577,7 @@ ax_get_wait( pcap_t *PPcap, int64_t TimeoutNs ) {
 
     // This is an internal routine and we already know PPcap->priv isn't NULL
     pRing = ((struct AxPriv *)PPcap->priv)->PRing;
+    ELOG("%s PPcap=%p pRing=%p",__func__,PPcap,pRing);
     dataAvail = 1;
     if (pRing->Put == pRing->Get) {
         //pRing->GetState = 3;
@@ -575,13 +613,23 @@ shared_memory_open(pcap_t *pcap, int blocking) {
     struct AxPriv *priv=(struct AxPriv *)pcap->priv;
     struct axrecvAllRings *rings;
     char *end;
+    int rval=0;
+    static pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER;
 
-    if(priv->shared_memory) return 0;
+    pthread_mutex_lock(&mutex);
+
+    if(priv->shared_memory && priv->PRing) {
+        rval=0;
+        goto out;
+    }
+
+    ELOG("%s %p",__func__,pcap);
 
     priv->shared_memory=openSharedMem(priv, &rings, blocking);
     if(priv->shared_memory == NULL) {
         pcap_cleanup_live_common( pcap );
-        return PCAP_ERROR;
+        rval=PCAP_ERROR;
+        goto out;
     }
 
     /* Figure out which ring the user wants us to access */
@@ -591,13 +639,20 @@ shared_memory_open(pcap_t *pcap, int blocking) {
         snprintf(pcap->errbuf, PCAP_ERRBUF_SIZE,
           "axellio error: ring buffer ID is invalid. device '%s'. "
           "Valid range is 0..31.",pcap->opt.device);
+        ELOG("%s",pcap->errbuf);
         (void)shmdt(priv->shared_memory);
         pcap_cleanup_live_common(pcap);
-        return PCAP_ERROR_NO_SUCH_DEVICE;
+        rval=PCAP_ERROR_NO_SUCH_DEVICE;
+        goto out;
     }
 
     /* We have validated devid so we can now setup our internal state */
     priv->PRing = &rings->Ring[devid];
+    rval=0;
+
+out:
+    ELOG("%s exit %d - PRing=%p",__func__,rval,priv->PRing);
+    pthread_mutex_unlock(&mutex);
 
     return 0; // success!
 }
@@ -641,9 +696,13 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
         return 0; // can't open memory, return no data
     }
 
+    ELOG("%s PPcap=%p pAx=%p",__func__,PPcap,pAx);
+
     /* Loop until we timeout or return a maximum defined number of packets */
     pRing = pAx->PRing;
     totalPackets = 0;
+
+    ELOG("%s pRing=%p",pRing);
 
     /* Try to read data from the ring. We have two modes of operation, blocking
      * and non blocking. During initial testing with tcpdump, the mode as
@@ -662,7 +721,7 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
         /* The pcap library will set this flag to stop us */
         if (unlikely(PPcap->break_loop)) {
             PPcap->break_loop = 0;
-            fprintf(stderr,"%s exit PCAP_ERROR_BREAK\n");
+            fprintf(stderr,"%s exit PCAP_ERROR_BREAK\n",__func__);
             fflush(stderr);
             return( PCAP_ERROR_BREAK );
         }
@@ -729,6 +788,7 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
             }
         }
     }
+    ELOG("%s exit %d",__func__,totalPackets);
     return totalPackets;
 }
 
@@ -743,6 +803,7 @@ static int
 ax_inject(struct pcap *PPcap, 
   const void *PBuf __attribute__((unused)), 
   size_t BufLen __attribute__((unused))) {
+    ELOG("%s",__func__);
     UNTESTED();
     snprintf(PPcap->errbuf, PCAP_ERRBUF_SIZE,
              "axellio error: Inject function has not been implemented yet");
@@ -762,6 +823,7 @@ static int
 ax_setnonblock( pcap_t *PPcap, int NonBlock ) {
     struct AxPriv *pAx;
 
+    ELOG("%s",__func__);
     pAx = (struct AxPriv *)PPcap->priv;
     if (unlikely(pAx == NULL)) {
         UNTESTED();
@@ -776,6 +838,7 @@ ax_getnonblock( pcap_t *PPcap ) {
     struct AxPriv *pAx;
 
     UNTESTED();
+    ELOG("%s",__func__);
     pAx = (struct AxPriv *)PPcap->priv;
     if (unlikely(pAx == NULL)) {
         UNTESTED();
@@ -788,6 +851,7 @@ static int
 ax_stats( pcap_t *PPcap, struct pcap_stat *PStat ) {
     struct AxPriv *pAx;
 
+    ELOG("%s",__func__);
     pAx = (struct AxPriv *)PPcap->priv;
     if (unlikely((PStat == NULL) || (pAx == NULL))) {
         UNTESTED();
@@ -810,6 +874,7 @@ static void
 ax_close( pcap_t *PPcap ) {
     struct AxPriv *pAx;
 
+    ELOG("%s",__func__);
     pAx = (struct AxPriv *)PPcap->priv;
     if (likely(pAx != NULL)) {
         (void)shmdt( pAx->shared_memory );
@@ -841,6 +906,8 @@ ax_activate( pcap_t *PPcap ) {
     pAx->PacketsRx = 0;
     pAx->PacketsDropped = 0;
     pAx->PacketsIfDropped = 0;
+
+    ELOG("ax_activate %p",PPcap);
 
     /* Setup our overrides for the pcap structure */
     PPcap->read_op = ax_read;
@@ -931,6 +998,7 @@ pcap_axellio_findalldevs( pcap_if_list_t *PDevList, char *PErrorBuf ) {
     char desc[64];
     struct AxPriv private;
 
+    ELOG("%s",__func__);
     private.shared_memory=openSharedMem( &private, &pAllRings, 1 );
     if (private.shared_memory == NULL) {
         UNTESTED();
