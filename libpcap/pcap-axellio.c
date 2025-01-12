@@ -721,8 +721,6 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
         /* The pcap library will set this flag to stop us */
         if (unlikely(PPcap->break_loop)) {
             PPcap->break_loop = 0;
-            fprintf(stderr,"%s exit PCAP_ERROR_BREAK\n",__func__);
-            fflush(stderr);
             return( PCAP_ERROR_BREAK );
         }
 
