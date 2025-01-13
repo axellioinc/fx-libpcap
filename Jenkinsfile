@@ -5,7 +5,7 @@ pipeline {
     }
 
     environment {
-        PROJECT="fx-lipbcap"
+        PROJECT="fx-libpcap"
         SSH_CRED_ID="axellio-build-github"
         ARCHIVE_DIRECTORY="/net/devsrv/build/${PROJECT}"
         ARCHIVE_SUBDIR="${ARCHIVE_DIRECTORY}/${BUILD_NUMBER}"
@@ -17,7 +17,7 @@ pipeline {
     stages {
         stage('el8') {
             environment {
-                        PODMAN_IMAGE="containers.swlab.axellio.dom/fx-cap_build_rocky8:9cdb416"
+                PODMAN_IMAGE="containers.swlab.axellio.dom/fx-cap_build_rocky8:9cdb416"
                 OS_PLATFORM="el8"
             }
             stages {
