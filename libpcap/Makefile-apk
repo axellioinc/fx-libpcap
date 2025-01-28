@@ -1,0 +1,18 @@
+all: apk
+
+VERSION := $(shell cat VERSION)
+BUILD_DIR := $(PWD)/NFPM_BUILD/sandbox/fx-libpcap-$(VERSION)
+PREFIX := usr
+AX_CONFIG := opt/axellio/config
+
+clean:
+	@rm -rf $(BUILD_DIR)
+
+apk:
+	./configure --prefix=$(BUILD_DIR)/$(PREFIX) --enable-axellio
+	make
+	make install
+	mkdir -p $(BUILD_DIR)/$(AX_CONFIG)
+	cp fx-libpcap.ini $(BUILD_DIR)/$(AX_CONFIG)/
+	python gen-nfpm-yaml.py --version-file VERSION --build-dir $(BUILD_DIR) > nfpm.yaml
+	nfpm package -f nfpm.yaml -p apk
