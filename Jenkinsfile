@@ -163,7 +163,7 @@ def makeBuild() {
 
 def archiveRpm() {
     sh "mkdir -p ${ARCHIVE_SUBDIR}"
-    sh "find . -name \"*rpm\" | xargs -I _ cp _ $ARCHIVE_SUBDIR"
+    sh "find . -name \"*.rpm\" | xargs -I _ cp _ $ARCHIVE_SUBDIR"
 }
 
 def makeAlpineClean() {
@@ -189,7 +189,7 @@ def makeAlpineBuild() {
 
 def archiveApk() {
     sh "mkdir -p ${ARCHIVE_SUBDIR}"
-    sh "find . -name \"*apk\" | xargs -I _ cp _ $ARCHIVE_SUBDIR"
+    sh "find . -name \"*.apk\" | xargs -I _ cp _ $ARCHIVE_SUBDIR"
 }
 
 def archiveStatus() {
