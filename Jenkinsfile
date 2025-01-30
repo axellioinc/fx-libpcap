@@ -82,6 +82,41 @@ pipeline {
 		}
             }
         }
+
+        stage('alpine') {
+            environment {
+                PODMAN_IMAGE="containers.swlab.axellio.dom/fx-cap_build_alpine320:56cb22b"
+                OS_PLATFORM="alpine"
+            }
+            stages {
+                stage('Configure') {
+                    steps {
+                        sshagent(credentials: [env.SSH_CRED_ID]) {
+                            sh "podman pull --tls-verify=false $PODMAN_IMAGE"
+                        }
+                    }
+                }
+
+                stage('Clean') {
+                    steps {
+                        makeAlpineClean()
+                    }
+                }
+
+                stage('Build') {
+                    steps {
+                        makeAlpineBuild()
+                    }
+                }
+
+		stage('Archive') {
+		    steps {
+			archiveApk()
+		    }
+		}
+            }
+        }
+
     }
 
     post {
@@ -129,6 +164,32 @@ def makeBuild() {
 def archiveRpm() {
     sh "mkdir -p ${ARCHIVE_SUBDIR}"
     sh "find . -name \"*rpm\" | xargs -I _ cp _ $ARCHIVE_SUBDIR"
+}
+
+def makeAlpineClean() {
+    sh """
+        podman run --rm -t \
+                   --mount type=bind,source=$WORKSPACE,destination=$SOURCE_DIRECTORY,relabel=shared \
+                   --workdir=$SOURCE_DIRECTORY \
+                   $PODMAN_IMAGE \
+                   bash --login -c "(cd libpcap; make -f Makefile-apk clean)"
+    """
+}
+
+def makeAlpineBuild() {
+    sh """
+        podman run --rm -t \
+                   --mount type=bind,source=$WORKSPACE,destination=$SOURCE_DIRECTORY,relabel=shared \
+                   --workdir=$SOURCE_DIRECTORY \
+                   -e BUILD_NUMBER=$BUILD_NUMBER \
+                   $PODMAN_IMAGE \
+                   bash --login -c "(cd libpcap; make -f Makefile-apk)"
+    """
+}
+
+def archiveApk() {
+    sh "mkdir -p ${ARCHIVE_SUBDIR}"
+    sh "find . -name \"*apk\" | xargs -I _ cp _ $ARCHIVE_SUBDIR"
 }
 
 def archiveStatus() {
