@@ -702,12 +702,12 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
      * blocking with a timeout of 1000ms. A timeout of zero is expected to wait
      * forever. We setup the timeout here and use it through the loop.
      */
-    fprintf(stderr,"%s: opt.timeout=%d pAx->NonBlock=%d\n",__func__,PPcap->opt.timeout,pAx->NonBlock);
     timeoutNs = (int64_t)PPcap->opt.timeout * 1000000LL;
     if (pAx->NonBlock) {
         // For non-blocking we set the timeout to 1ns to get an immediate
         // return, no waiting.
-        timeoutNs = 1;
+        // timeoutNs = 1;
+        // TODO - Do NOT ignore NonBlock
     }
 
     while ((PACKET_COUNT_IS_UNLIMITED(MaxNumPackets)) ||
@@ -822,6 +822,7 @@ ax_setnonblock( pcap_t *PPcap, int NonBlock ) {
         return( -1 );
     }
     pAx->NonBlock = NonBlock;
+    fprintf(stderr,"%s: Setting NonBlock to %d\n",__func__,NonBlock);
     return 0;
 }
 
