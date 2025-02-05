@@ -568,36 +568,36 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
  * @return 0 - Timedout or 'break_loop' and nothing available, 1 - Data is
  *         available on the ring
  */
-static int 
+static int
 ax_get_wait( pcap_t *PPcap, int64_t TimeoutNs ) {
     struct axrecvRing *pRing;
     int64_t expire=0;
-    int dataAvail=0;
 
     // This is an internal routine and we already know PPcap->priv isn't NULL
     pRing = ((struct AxPriv *)PPcap->priv)->PRing;
     ELOG("%s PPcap=%p pRing=%p",__func__,PPcap,pRing);
-    if (pRing->Put == pRing->Get) {
-        // Calculate how long we will run before timing out
-        if (TimeoutNs > 1) {
-            expire = getMonotonicOffset() + TimeoutNs;
-        }
 
-        // Loop until we either get data, we run out of time, or we're told off
-        while(1) {
-            if(pRing->Put!=pRing->Get) break; // We got data
-            if(TimeoutNs>0 && getMonotonicOffset()>expire) break; // Out of time
-            if(PPcap->break_loop) break; // We're told off
-            // Nothing happened. Sleep a bit and try again.
-            usleep(100);
-        }
+    // Is there data available already?
+    if(pRing->Put != pRing->Get) return 1;
 
-        // Did we get data?
-        if (pRing->Put != pRing->Get) {
-            dataAvail = 1;
-        }
+    // Calculate how long we will run before timing out
+    if(TimeoutNs > 1) {
+        expire = getMonotonicOffset() + TimeoutNs;
     }
-    return dataAvail;
+
+    // Loop until we either get data, we run out of time, or we're told off
+    while(1) {
+        if(pRing->Put!=pRing->Get) return 1; // We got data
+        if(TimeoutNs>0 && getMonotonicOffset()>expire) {
+            return 0; // Out of time
+        }
+        if(PPcap->break_loop) return 0; // We're told off
+        // Nothing happened. Sleep a bit and try again.
+        usleep(100);
+    }
+
+    // Should not get here?
+    return 0;
 }
 
 static int
@@ -702,6 +702,7 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
      * blocking with a timeout of 1000ms. A timeout of zero is expected to wait
      * forever. We setup the timeout here and use it through the loop.
      */
+    fprintf(stderr,"%s: opt.timeout=%d pAx->NonBlock=%d\n",__func__,PPcap->opt.timeout,pAx->NonBlock);
     timeoutNs = (int64_t)PPcap->opt.timeout * 1000000LL;
     if (pAx->NonBlock) {
         // For non-blocking we set the timeout to 1ns to get an immediate
