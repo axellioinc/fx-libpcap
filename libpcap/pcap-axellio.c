@@ -571,40 +571,33 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
 static int 
 ax_get_wait( pcap_t *PPcap, int64_t TimeoutNs ) {
     struct axrecvRing *pRing;
-    int64_t now;
-    int64_t expire;
-    int dataAvail;
+    int64_t expire=0;
+    int dataAvail=0;
 
     // This is an internal routine and we already know PPcap->priv isn't NULL
     pRing = ((struct AxPriv *)PPcap->priv)->PRing;
     ELOG("%s PPcap=%p pRing=%p",__func__,PPcap,pRing);
-    dataAvail = 1;
     if (pRing->Put == pRing->Get) {
-        //pRing->GetState = 3;
-        now = -1;
-        expire = 0;
+        // Calculate how long we will run before timing out
         if (TimeoutNs > 1) {
-            now = getMonotonicOffset();
-            expire = now + TimeoutNs;
-        } else if (TimeoutNs == 1) {
-            // We don't want to loop at all so we reset to skip the loop below
-            now = expire;
+            expire = getMonotonicOffset() + TimeoutNs;
         }
 
-        /* When expire == 0, now == -1 and this will loop until data is ready */
-        while((pRing->Put == pRing->Get) && (now < expire) &&
-          (!PPcap->break_loop)) {
-            usleep( 100 );
-            now = getMonotonicOffset();
+        // Loop until we either get data, we run out of time, or we're told off
+        while(1) {
+            if(pRing->Put!=pRing->Get) break; // We got data
+            if(TimeoutNs>0 && getMonotonicOffset()>expire) break; // Out of time
+            if(PPcap->break_loop) break; // We're told off
+            // Nothing happened. Sleep a bit and try again.
+            usleep(100);
         }
 
-        // To get here we either expired the timeout or have data on the queue
-        if (pRing->Put == pRing->Get) {
-            dataAvail = 0;
+        // Did we get data?
+        if (pRing->Put != pRing->Get) {
+            dataAvail = 1;
         }
-        //pRing->GetState = 1;
     }
-    return( dataAvail );
+    return dataAvail;
 }
 
 static int
