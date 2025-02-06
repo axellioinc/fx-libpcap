@@ -568,43 +568,36 @@ openSharedMem( struct AxPriv *priv, struct axrecvAllRings **PPAllRings,
  * @return 0 - Timedout or 'break_loop' and nothing available, 1 - Data is
  *         available on the ring
  */
-static int 
+static int
 ax_get_wait( pcap_t *PPcap, int64_t TimeoutNs ) {
     struct axrecvRing *pRing;
-    int64_t now;
-    int64_t expire;
-    int dataAvail;
+    int64_t expire=0;
 
     // This is an internal routine and we already know PPcap->priv isn't NULL
     pRing = ((struct AxPriv *)PPcap->priv)->PRing;
     ELOG("%s PPcap=%p pRing=%p",__func__,PPcap,pRing);
-    dataAvail = 1;
-    if (pRing->Put == pRing->Get) {
-        //pRing->GetState = 3;
-        now = -1;
-        expire = 0;
-        if (TimeoutNs > 1) {
-            now = getMonotonicOffset();
-            expire = now + TimeoutNs;
-        } else if (TimeoutNs == 1) {
-            // We don't want to loop at all so we reset to skip the loop below
-            now = expire;
-        }
 
-        /* When expire == 0, now == -1 and this will loop until data is ready */
-        while((pRing->Put == pRing->Get) && (now < expire) &&
-          (!PPcap->break_loop)) {
-            usleep( 100 );
-            now = getMonotonicOffset();
-        }
+    // Is there data available already?
+    if(pRing->Put != pRing->Get) return 1;
 
-        // To get here we either expired the timeout or have data on the queue
-        if (pRing->Put == pRing->Get) {
-            dataAvail = 0;
-        }
-        //pRing->GetState = 1;
+    // Calculate how long we will run before timing out
+    if(TimeoutNs > 1) {
+        expire = getMonotonicOffset() + TimeoutNs;
     }
-    return( dataAvail );
+
+    // Loop until we either get data, we run out of time, or we're told off
+    while(1) {
+        if(pRing->Put!=pRing->Get) return 1; // We got data
+        if(TimeoutNs>0 && getMonotonicOffset()>expire) {
+            return 0; // Out of time
+        }
+        if(PPcap->break_loop) return 0; // We're told off
+        // Nothing happened. Sleep a bit and try again.
+        usleep(100);
+    }
+
+    // Should not get here?
+    return 0;
 }
 
 static int
@@ -713,7 +706,8 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
     if (pAx->NonBlock) {
         // For non-blocking we set the timeout to 1ns to get an immediate
         // return, no waiting.
-        timeoutNs = 1;
+        // timeoutNs = 1;
+        // TODO - Do NOT ignore NonBlock
     }
 
     while ((PACKET_COUNT_IS_UNLIMITED(MaxNumPackets)) ||
@@ -721,8 +715,6 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
         /* The pcap library will set this flag to stop us */
         if (unlikely(PPcap->break_loop)) {
             PPcap->break_loop = 0;
-            fprintf(stderr,"%s exit PCAP_ERROR_BREAK\n",__func__);
-            fflush(stderr);
             return( PCAP_ERROR_BREAK );
         }
 
@@ -830,6 +822,7 @@ ax_setnonblock( pcap_t *PPcap, int NonBlock ) {
         return( -1 );
     }
     pAx->NonBlock = NonBlock;
+    fprintf(stderr,"%s: Setting NonBlock to %d\n",__func__,NonBlock);
     return 0;
 }
 
