@@ -99,7 +99,7 @@ pipeline {
 
                 stage('Clean') {
                     steps {
-                        makeAlpineClean()
+                        makeClean()
                     }
                 }
 
@@ -146,7 +146,7 @@ def makeClean() {
                    --mount type=bind,source=$WORKSPACE,destination=$SOURCE_DIRECTORY,relabel=shared \
                    --workdir=$SOURCE_DIRECTORY \
                    $PODMAN_IMAGE \
-                   bash --login -c "(cd libpcap; make -f Makefile-rpm clean)"
+                   bash --login -c "git clean -fdx ."
     """
 }
 
@@ -164,16 +164,6 @@ def makeBuild() {
 def archiveRpm() {
     sh "mkdir -p ${ARCHIVE_SUBDIR}"
     sh "find . -name \"*.rpm\" | xargs -I _ cp _ $ARCHIVE_SUBDIR"
-}
-
-def makeAlpineClean() {
-    sh """
-        podman run --rm -t \
-                   --mount type=bind,source=$WORKSPACE,destination=$SOURCE_DIRECTORY,relabel=shared \
-                   --workdir=$SOURCE_DIRECTORY \
-                   $PODMAN_IMAGE \
-                   bash --login -c "(cd libpcap; make -f Makefile-apk clean)"
-    """
 }
 
 def makeAlpineBuild() {
