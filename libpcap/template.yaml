@@ -1,5 +1,5 @@
 name: "fx-libpcap"
-arch: "intel"
+arch: "x86_64"
 platform: "linux"
 version: "1.0.0"
 section: "default"
