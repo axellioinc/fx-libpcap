@@ -13,6 +13,7 @@
 #include <ctype.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <poll.h>
 
 #include "pcap-int.h"
 #include "pcap-axellio.h"
@@ -23,27 +24,6 @@
 // Output from ELOG() will go into /tmp/surilog as a text file
 #define EDEBUG 0
 #define ELOG(...) if(EDEBUG) do_elog(__LINE__,__VA_ARGS__);
-
-static void do_elog(int line, char *fmt, ...) {
-    va_list ap;
-    static FILE *fp=NULL;
-    static pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER;
-
-    va_start(ap,fmt);
-    pthread_mutex_lock(&mutex);
-    if(!fp) {
-        char fname[200];
-        mkdir("/tmp/surilog",S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
-        sprintf(fname,"/tmp/surilog/fxlibpcap%d.log",getpid());
-        fp=fopen(fname,"a");
-    }
-    fprintf(fp,"%d:",line);
-    vfprintf(fp,fmt,ap);
-    fprintf(fp,"\n");
-    fflush(fp);
-    pthread_mutex_unlock(&mutex);
-    va_end(ap);
-}
 
 // This is our stateful information passed to us by pcap
 struct AxPriv {
@@ -63,6 +43,14 @@ struct AxPriv {
     // This is the pointer to the shared memory that we will need to shmdt()
     // upon exit.
     void *shared_memory;
+
+    // Pipe used for the selectable fd stuff.
+    int pipefd[2];
+    int pipe_avail;
+    pthread_mutex_t pipe_mutex;
+    pthread_t pipe_worker;
+
+    int exiting;
 };
 
 /**
@@ -78,6 +66,28 @@ getMonotonicOffset() {
 
     (void)clock_gettime( CLOCK_MONOTONIC, &ts );
     return( (ts.tv_sec * 1000000000LL) + ts.tv_nsec );
+}
+
+static void do_elog(int line, char *fmt, ...) {
+    va_list ap;
+    static FILE *fp=NULL;
+    static pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER;
+
+    va_start(ap,fmt);
+    pthread_mutex_lock(&mutex);
+    if(!fp) {
+        char fname[200];
+        mkdir("/tmp/surilog",S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+        sprintf(fname,"/tmp/surilog/fxlibpcap%d.log",getpid());
+        fp=fopen(fname,"a");
+        if(!fp) { perror("can't open log"); return; }
+    }
+    fprintf(fp,"%d [%" PRId64 "]:",line, getMonotonicOffset());
+    vfprintf(fp,fmt,ap);
+    fprintf(fp,"\n");
+    fflush(fp);
+    pthread_mutex_unlock(&mutex);
+    va_end(ap);
 }
 
 struct option {
@@ -160,7 +170,6 @@ int
 config_readfile(char *file, struct config *options) {
 	FILE *fp=fopen(file,"r");
 	if(!fp) {
-		perror("can't open");
 		return -errno;
 	}
 	struct section *section=section_get("",options,1);
@@ -576,6 +585,7 @@ ax_get_wait( pcap_t *PPcap, int64_t TimeoutNs ) {
     // This is an internal routine and we already know PPcap->priv isn't NULL
     pRing = ((struct AxPriv *)PPcap->priv)->PRing;
     ELOG("%s PPcap=%p pRing=%p",__func__,PPcap,pRing);
+    if(!pRing) return 0;
 
     // Is there data available already?
     if(pRing->Put != pRing->Get) return 1;
@@ -695,7 +705,7 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
     pRing = pAx->PRing;
     totalPackets = 0;
 
-    ELOG("%s pRing=%p",pRing);
+    ELOG("%s pRing=%p",__func__,pRing);
 
     /* Try to read data from the ring. We have two modes of operation, blocking
      * and non blocking. During initial testing with tcpdump, the mode as
@@ -780,6 +790,13 @@ ax_read(pcap_t *PPcap, int MaxNumPackets, pcap_handler PCb,
             }
         }
     }
+    if(pAx->pipe_worker && pRing->Get==pRing->Put && pAx->pipe_avail) {
+        pthread_mutex_lock(&pAx->pipe_mutex);
+        pAx->pipe_avail=0;
+        char buf;
+        read(pAx->pipefd[0],&buf,1);
+        pthread_mutex_unlock(&pAx->pipe_mutex);
+    }
     ELOG("%s exit %d",__func__,totalPackets);
     return totalPackets;
 }
@@ -815,14 +832,13 @@ static int
 ax_setnonblock( pcap_t *PPcap, int NonBlock ) {
     struct AxPriv *pAx;
 
-    ELOG("%s",__func__);
+    ELOG("%s %d",__func__,NonBlock);
     pAx = (struct AxPriv *)PPcap->priv;
     if (unlikely(pAx == NULL)) {
         UNTESTED();
         return( -1 );
     }
     pAx->NonBlock = NonBlock;
-    fprintf(stderr,"%s: Setting NonBlock to %d\n",__func__,NonBlock);
     return 0;
 }
 
@@ -870,13 +886,51 @@ ax_close( pcap_t *PPcap ) {
     ELOG("%s",__func__);
     pAx = (struct AxPriv *)PPcap->priv;
     if (likely(pAx != NULL)) {
+        if(pAx->pipe_worker) {
+            pAx->exiting=1;
+            pthread_join(pAx->pipe_worker,NULL);
+            close(pAx->pipefd[0]);
+            close(pAx->pipefd[1]);
+            pAx->pipe_worker=0;
+        }
+
         (void)shmdt( pAx->shared_memory );
         pAx->shared_memory = NULL;
         pAx->PRing=NULL;
 
         /* After this, pAx is no longer valid */
         pcap_cleanup_live_common( PPcap );
+
         pAx = NULL;
+    }
+}
+
+static int is_fd_ready(int fd) {
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    return poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN);
+}
+
+static void *pipe_bg_thread(void *arg) {
+    pcap_t *pcap=(pcap_t *)arg;
+    struct AxPriv *ax=(struct AxPriv *)pcap->priv;
+    int sleep_amount=1000;
+
+    while(!ax->exiting) {
+        usleep(sleep_amount);
+        volatile struct axrecvRing *ring=ax->PRing;
+        if(!ring) {
+            shared_memory_open(pcap,0);
+            continue;
+        }     
+        if(is_fd_ready(ax->pipefd[0])) continue;
+        if(ring->Get!=ring->Put) {
+            pthread_mutex_lock(&ax->pipe_mutex);
+            if(!ring->Get!=ring->Put) {
+                ax->pipe_avail=1;
+                write(ax->pipefd[1],"x",1);
+            }
+            pthread_mutex_unlock(&ax->pipe_mutex);
+        }
     }
 }
 
@@ -913,11 +967,18 @@ ax_activate( pcap_t *PPcap ) {
 
     PPcap->linktype = DLT_EN10MB; // Ethernet, the 10MB is historical.
 
-    //raj does this work?
-    PPcap->selectable_fd = -1;
+    pAx->pipe_worker=0;
+    if(pipe(pAx->pipefd)==-1) {
+        PPcap->selectable_fd = -1;
+    } else {
+        PPcap->selectable_fd = pAx->pipefd[0];
+        pthread_mutex_init(&pAx->pipe_mutex,NULL);
+        pAx->pipe_avail=0;
+        pAx->exiting=0;
+        pthread_create(&pAx->pipe_worker,NULL,pipe_bg_thread,PPcap);
+    }
     PPcap->required_select_timeout = NULL;
 
-    //PPcap->activate_op        set prev
     //PPcap->can_set_rfmon_op
     PPcap->inject_op = ax_inject;
     //PPcap->save_current_filter_op
