@@ -36,11 +36,13 @@ def print_dir_listing(args):
         data['contents'].append({'src' : full_path, 'dst' : reloc_path})
     print(yaml.dump(data), end="")
 
-def print_yaml_template(args, version):
+def print_yaml_template(args, version, release):
     # Must have a template file
     data = read_yaml_base(args.template)
     if version:
         data['version'] = version
+    if release:
+        data['release'] = release
     if args.template:
         for entry in data['contents']:
             entry['src'] = entry['src'].replace('{{BUILD-DIR}}', args.build_dir)
@@ -53,6 +55,7 @@ def main():
     parser.add_argument('--template', default='template.yaml', help='template yaml file to start with')
     parser.add_argument('--build-dir', help='build directory (root)')
     parser.add_argument('--version-file', help='version file to read from')
+    parser.add_argument('--release', help='specify a release number')
     args = parser.parse_args()
 
     # Read VERSION file if possible
@@ -63,7 +66,7 @@ def main():
     if args.list:
         print_dir_listing(args)
     elif args.template:
-        print_yaml_template(args, version)
+        print_yaml_template(args, version, args.release)
     else:
         sys.stderr.write("Invalid command")
 
