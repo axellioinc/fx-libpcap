@@ -16,4 +16,4 @@ apk:
 	mkdir -p $(BUILD_DIR)/$(AX_CONFIG)
 	cp fx-libpcap.ini $(BUILD_DIR)/$(AX_CONFIG)/
 	python gen-nfpm-yaml.py --version-file VERSION --build-dir $(BUILD_DIR) --release $(BUILD_NUMBER) > nfpm.yaml
-	nfpm package -f nfpm.yaml -p apk
+	nfpm package -f nfpm.yaml -p apk -t fx-libpcap-$(VERSION)-r$(BUILD_NUMBER).apk
