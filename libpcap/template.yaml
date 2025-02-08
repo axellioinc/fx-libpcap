@@ -5,7 +5,7 @@ version: "1.0.0"
 section: "default"
 priority: "extra"
 maintainer: "<support@axellio.com>"
-description: High speed packet capture and flow distribution system
+description: Axellio PacketXpress libpcap integration
 vendor: "Axellio, Inc"
 homepage: "http://axellio.com"
 license: "Proprietary"
